@@ -26,9 +26,11 @@
 
 ## Layout
 - `platformio.ini`: one env per board program (`mic`, `servo`), selected with `build_src_filter`.
-- `src/mic.cpp`: reads both I2S buses (legacy `driver/i2s.h`) and writes `SYNC` + bus A block + bus B block to USB serial.
+- `src/mic.cpp`: reads both I2S buses (legacy `driver/i2s.h`). Per packet: writes `SYNC` + bus A block + bus B block, then `DIRV` + 4 band-RMS amplitudes + vector x, y (float32 LE, 28 bytes). Amplitude = RMS in `BAND_LO..BAND_HI` from a 1024-point ESP-DSP FFT. Vector = amplitude-weighted mean of mic facing directions (`AZ_DEG`), length 0..1.
 - `src/servo.cpp`: servo test on GPIO12 (LEDC PWM, 50 Hz, 600 to 2400 us).
 - `host/plot.py`: Mac script. Background thread reads the serial port and resyncs on `SYNC`. Plots a live FFT spectrum per mic (2048-point, Hann window, dBFS, 0 to 8 kHz), all 4 overlaid.
+- `host/peak.py`: Mac script. FFT every packet (62.5/s); picks the loudest bin above 100 Hz across all 4 mics and plots each mic's dBFS at that bin over the last 10 s, plus the bin frequency.
+- `host/vector.py`: Mac script. Reads `DIRV` packets; bar chart of band level per mic (dBFS) and the direction vector with a 1 s trail. `AZ_DEG` must match `mic.cpp`.
 - `host/scope.py`: Mac script. Same reader, plots 4 scrolling waveforms (min/max envelope). Use for tap tests.
 - `legacy/micropython/`: old MicroPython scripts, for reference only.
 
@@ -43,6 +45,8 @@
 - Bus A and bus B have separate SCK/WS. Same clock source and rate, so no drift expected, but the phase offset is arbitrary at each boot (unverified). Irrelevant for amplitude comparison; matters only for TDOA.
 - MicroPython (v1.29 generic S3) capped stdout at 11.4 KB/s, measured on the board. Likely cause: stdout duplicated to UART0 at 115200. This is why we switched.
 - Stereo slot order (column 0 = left) was confirmed under MicroPython only. Re-check under Arduino.
+- ESP-DSP optimised FFT needs 16-byte aligned buffers (`__attribute__((aligned(16)))`). Unaligned gave about +24 dBFS on every mic.
+- Board band RMS verified against numpy on the same audio: 0.0000 dB max difference over 624 packets.
 - Data layout: 24-bit samples left-justified in 32-bit words, so `>> 8` on the Mac. SPH0645-type mics may need 7 or 9.
 - USB stream: measured 256.5 KB/s, 62.51 packets/s (16.0 kHz) under Arduino, 20 s steady state after draining the start-up backlog.
 - DTR/RTS on the USB port drive the chip's reset/boot lines. Open the port with `dtr = rts = False` (as `plot.py` does) or the board can drop into the bootloader.
@@ -61,5 +65,7 @@
 
 ## Open actionables
 - Tap test under Arduino to re-confirm channel order.
-- Directivity sweep per shrouded mic to pick the FFT band.
-- Per-mic gain calibration.
+- Directivity sweep per shrouded mic to pick the FFT band, then set `BAND_LO`/`BAND_HI` in `mic.cpp`.
+- Set `AZ_DEG` in `mic.cpp` and `vector.py` to the real mic layout (placeholder: 0, 90, 180, 270).
+- Per-mic gain calibration, into `GAIN` in `mic.cpp`.
+- Map vector to gimbal angles (needs the directivity data); add a level gate so silence doesn't steer.

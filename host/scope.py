@@ -66,6 +66,7 @@ for i, ax in enumerate(axes):
     ax.set_title(f"Mic {i + 1}", fontsize=9)
     lines.append(ln)
 axes[0].set_ylim(-ylim, ylim)
+axes[-1].set_xlim(-WINDOW_S, 0)
 axes[-1].set_xlabel("Time (s)")
 
 def update(_):

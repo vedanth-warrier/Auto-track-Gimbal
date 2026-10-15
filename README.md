@@ -3,9 +3,11 @@
 DESN2000 project (UNSW). 4-microphone I2S array on a Waveshare ESP32-S3-Zero, streamed over USB to a Mac for live plotting.
 
 ## Layout
-- `src/mic.cpp`: board program. Reads both I2S buses and streams `SYNC` + bus A + bus B over USB serial.
+- `src/mic.cpp`: board program. Streams raw audio, plus per-mic band amplitudes and a direction vector computed on the board.
 - `src/servo.cpp`: board program. Servo test on GPIO12.
 - `host/plot.py`: Mac script. Live FFT spectrum (dBFS vs frequency) for all 4 mics.
+- `host/peak.py`: Mac script. Level of the loudest frequency for each mic over time.
+- `host/vector.py`: Mac script. Per-mic band levels and the direction vector.
 - `host/scope.py`: Mac script. 4 scrolling waveforms, for tap tests.
 - `legacy/micropython/`: the original MicroPython versions, kept for reference.
 
