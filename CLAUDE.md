@@ -23,12 +23,12 @@
 - Firmware: plain `ESP32_GENERIC_S3` build. Not `SPIRAM_OCT`. Flash offset `0x0`.
 - `mpremote` for file copy, REPL and resets. Installed via pipx or uv tool.
 - Python on the Mac runs through `uv` (project `.venv`). Run scripts with `uv run`, never bare `python`.
-- Mac-side deps: pyserial, numpy, matplotlib. Install with `uv pip install`.
+- Mac-side deps: pyserial, numpy, matplotlib, listed in `requirements.txt`. Install with `uv pip install -r requirements.txt`.
 
 ## Layout
 - `src/mic.py`: board script. Reads both I2S buses and writes `SYNC` + bus A block + bus B block to USB serial. Deployed as `main.py`.
 - `src/plot.py`: Mac script. Opens the serial port with pyserial, resyncs on `SYNC`, plots 4 scrolling waveforms.
-- `firmware/`: MicroPython `.bin` files.
+- `firmware/`: MicroPython `.bin` files. Gitignored; download link in `README.md`.
 
 ## Workflow (important)
 - DO NOT run `mpremote run src/mic.py | uv run src/plot.py`. `plot.py` reads the serial port directly, so `mpremote` and `plot.py` fight over the port, and the unread pipe blocks `mpremote`. This caused the slow, garbled plot.
