@@ -1,31 +1,3 @@
-# from machine import Pin, I2S
-# import array
-
-# SCK, WS, SD = 5, 6, 3
-# RATE = 16000
-# BUF_BYTES = 4096
-
-# mic = I2S(
-#     0,
-#     sck=Pin(SCK),
-#     ws=Pin(WS),
-#     sd=Pin(SD),
-#     mode=I2S.RX,
-#     bits=32,
-#     format=I2S.STEREO,
-#     rate=RATE,
-#     ibuf=20000,
-# )
-
-# buf = bytearray(BUF_BYTES)
-
-# while True:
-#     n = mic.readinto(buf)
-#     samples = array.array("i", buf[:n])
-#     # INMP441 data is 24-bit left-justified in a 32-bit word
-#     peak = max(abs(s >> 8) for s in samples)
-#     print(peak)
-
 from machine import Pin, I2S
 import sys
 
