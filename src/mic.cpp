@@ -31,7 +31,7 @@ static const float FLOOR_HZ = 1000;     // noise floor taken from bins within th
 static const float DETECT_DB = 12;      // tone must be this far above the noise floor in a packet...
 static const int MIN_RUN = 6;           // ...for this many packets in a row (48 ms) at the same frequency (+/- 2 bins).
                                         // Room sound gave isolated hits (runs of 3 at most); a beacon is continuous
-static const float GAIN[4] = {1.065f, 0.922f, 0.887f, 1.152f};  // per-mic gain correction (from 2-6 kHz; recalibrate at TONE_HZ with host/calibrate.py)
+static const float GAIN[4] = {1.312f, 0.927f, 0.727f, 1.131f};  // per-mic gain correction (from 2-6 kHz; recalibrate at TONE_HZ with host/calibrate.py)
 static const float AZ_DEG[4] = {90, 180, 0, 270};  // direction each mic faces around the vertical (mic 1..4)
 
 static const int K_TOL = std::max(2, (int)(TONE_TOL_HZ / BIN_HZ + 0.5f));  // tone search half-width (bins)

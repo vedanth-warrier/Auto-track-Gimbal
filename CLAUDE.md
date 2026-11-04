@@ -47,7 +47,7 @@
 - `src/servo.cpp`: servo test on GPIO12 (LEDC PWM, 50 Hz, 600 to 2400 us).
 - `host/stream.py`: shared serial reader. Finds the port (`/dev/cu.usbmodem*`), opens it with DTR/RTS low, parses packets, calls `on_audio` / `on_dir`. The packet format lives here and in `mic.cpp` only.
 - Packet: `SYNC` + bus A (1024 B) + bus B (1024 B, each 256 stereo frames int16 [left, right]) + `DIRV` + 8 float32 (4 amplitudes, x, y, tone Hz, SNR dB). 2088 bytes, little-endian.
-- `host/vector.py`: tone level bars per mic, raw and smoothed vector (`TAU`), `SCALE` display gain, angle in the title.
+- `host/vector.py`: tone level bars per mic, raw and smoothed vector (`TAU`), `SCALE` display gain, angle in the title. `WEIGHTS` (mic 1..4) multiply the board's per-mic levels and the vector is recomputed on the Mac, for trial-and-error tuning without reflashing; all 1 = the board's own vector.
 - `host/plot.py`: live spectrum per mic (4096-point, dBFS, 0 to 16 kHz).
 - `host/peak.py`: level of the loudest bin per mic over 10 s, plus its frequency.
 - `host/scope.py`: 4 scrolling waveforms (min/max envelope). Use for tap tests.
@@ -67,9 +67,9 @@
 - `mic_test` (synthetic 7 kHz, 0.01 FS, mic 1 at 2x): tone 7000.00 Hz, amplitudes and vector match expected to 4-5 significant figures; raw stream amplitudes exact.
 - False tone outputs on room sound: 0 to 19 per 7500 packets (0 to 0.25%) with `DETECT_DB` 12 and `MIN_RUN` 6. Without persistence, 0.2 to 1% (single-packet hits up to 3 in a row, SNR 12-13 dB).
 - At 32 kHz the stream shows 4-14 isolated single-sample spikes per second per mic, about 0.03 FS each, rarely on two mics at once: likely bit errors from the faster SCK over jumpers. Effect on the 7 kHz noise floor: 0.00 to 0.05 dB. Shorten SCK/WS jumpers if it grows.
-- `GAIN` currently from 2-6 kHz harmonics (440 Hz sawtooth, 2026-11-04): {1.065, 0.922, 0.887, 1.152}, +/- 0.6 dB. Not yet measured at 7 kHz. `GAIN` applies only to the DIRV output; plot/scope/peak.py show uncorrected levels.
+- `GAIN` in `mic.cpp` is now {1.312, 0.927, 0.727, 1.131} (set by user 2026-11-04, presumably from calibrate.py at 7 kHz). `GAIN` applies only to the DIRV output; plot/scope/peak.py show uncorrected levels.
 - Gain calibration: single-run offsets moved by up to 2.3 dB when the array was rotated, so average over rotations (calibrate.py does 4).
-- Mic 4 has a flat noise floor up to +24 dB above the others at 6-8 kHz (2026-11-04). Stays with position 4 when modules are swapped, so it's that position's wiring, not the module. Raises the 7 kHz noise floor at mic 4 only.
+- Mic 4 extra noise (up to +24 dB at 6-8 kHz) was a wiring fault at position 4; fixed 2026-11-04.
 - 440 Hz sawtooth sweeps (16 kHz, harmonic method, 2026-11-04): per-mic level change with direction +/-0.6 to 2.2 dB; at 7040 Hz +/-2.2 dB with all 4 mics agreeing within 18 deg on a common offset of -131 deg from `AZ_DEG`. To be re-measured at 7 kHz with the tone tracker.
 - ESP-DSP optimised FFT needs 16-byte aligned buffers (`__attribute__((aligned(16)))`). Unaligned gave about +24 dBFS on every mic.
 - Arduino defines `BIN` as a macro (Print.h). Don't use it as a name.
@@ -90,8 +90,6 @@
 - I often dictate. Garbled technical terms are transcription errors, not knowledge gaps. Ask if a term looks wrong.
 
 ## Open actionables
-- Calibrate gains at 7 kHz with `host/calibrate.py`, paste the `GAIN` line into `mic.cpp`, flash.
 - Real-tone check in `vector.py` (detection, SNR, vector direction per mic).
 - 8-direction directivity sweep at 7 kHz.
-- Mic 4 position: check its VDD/GND jumpers (noise stays with the position).
 - Servo loop: map vector to gimbal angles, deadband (about 4-5 deg), port the `vector.py` smoothing to the board.

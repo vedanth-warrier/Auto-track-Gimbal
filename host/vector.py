@@ -8,6 +8,7 @@ import matplotlib.animation as animation
 from stream import Stream, RATE, HOP
 
 AZ_DEG = [90, 180, 0, 270]   # must match AZ_DEG in src/mic.cpp
+WEIGHTS = [0.95, 0.88, 1.12, 1.0]   # mic 1..4: multiplies each mic's level before the vector is computed (1 = as the board sends it)
 YBOT, YTOP = -110, 0         # dBFS range of the level bars
 GATE_DB = -70                # vector drawn grey when the loudest mic is below this
 TRAIL_S = 1.0                # seconds of vector history drawn as a trail
@@ -23,8 +24,16 @@ trail = deque()              # (time, x, y) of the smoothed vector, tone packets
 lock = threading.Lock()
 alpha = 1 - math.exp(-PKT_S / TAU)   # exponential average weight per packet
 
+W = np.array(WEIGHTS)
+DX, DY = np.cos(np.radians(AZ_DEG)), np.sin(np.radians(AZ_DEG))
+
 def on_dir(amps, x, y, freq, snr):
+    # Recompute the vector from the board's per-mic levels with WEIGHTS applied
+    # (with all weights 1 this is exactly the board's own x, y)
     global latest, smooth
+    amps = amps * W
+    if snr > 0 and amps.sum() > 0:
+        x, y = (amps * DX).sum() / amps.sum(), (amps * DY).sum() / amps.sum()
     with lock:
         latest = (amps, x, y, freq, snr)
         if snr > 0:
