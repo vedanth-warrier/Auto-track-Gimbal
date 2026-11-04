@@ -1,61 +1,28 @@
 import threading
 import time
 from collections import deque
-import serial
 import numpy as np
 import matplotlib.pyplot as plt
 import matplotlib.animation as animation
+from stream import Stream, RATE
 
-PORT = "/dev/cu.usbmodem2101"
-RATE = 16000
-SHIFT = 8
-BLK = 2048
-PKT = 4 + 2*BLK
-NFFT = 2048        # FFT length: 128 ms of audio, 7.8 Hz per bin
-FULL_SCALE = 2**23 # 24-bit signed full scale -> 0 dBFS
+NFFT = 4096        # FFT length: 128 ms of audio, 7.8 Hz per bin
 YBOT = -130        # dBFS, bottom of the plot (below the mic noise floor)
 YHEAD = 6          # dB of space above the highest peak
 PEAK_S = 1.0       # y-top follows the highest peak over this many seconds
 
-ring = np.zeros((4, NFFT), dtype=np.int32)   # row 0..3 = mic 1..4, circular
-head = 0                                     # next write position in ring
+ring = np.zeros((4, NFFT))   # row 0..3 = mic 1..4, circular, full-scale units
+head = 0                     # next write position in ring
 lock = threading.Lock()
 
-# DTR/RTS drive the ESP32-S3's reset/boot lines over USB-Serial-JTAG; keep them low
-ser = serial.Serial()
-ser.port = PORT
-ser.timeout = 0.1
-ser.dtr = False
-ser.rts = False
-ser.open()
-ser.reset_input_buffer()
-
-def reader():
-    # Runs in the background so the port is drained at full rate, however slow drawing is
+def on_audio(block):
     global head
-    rx = b""
-    while True:
-        rx += ser.read(max(1, ser.in_waiting))
-        while True:
-            i = rx.find(b"SYNC")
-            if i < 0:
-                rx = rx[-3:]
-                break
-            if len(rx) < i + PKT:
-                rx = rx[i:]
-                break
-            body = rx[i + 4 : i + PKT]
-            rx = rx[i + PKT :]
-            w = np.frombuffer(body, dtype="<i4") >> SHIFT
-            a = w[: BLK // 4].reshape(-1, 2)    # bus A: col0 = left = mic 2, col1 = right = mic 1
-            b = w[BLK // 4 :].reshape(-1, 2)    # bus B: col0 = left = mic 4, col1 = right = mic 3
-            block = np.stack([a[:, 1], a[:, 0], b[:, 1], b[:, 0]])
-            idx = (head + np.arange(block.shape[1])) % NFFT
-            with lock:
-                ring[:, idx] = block
-                head = (head + block.shape[1]) % NFFT
+    idx = (head + np.arange(block.shape[1])) % NFFT
+    with lock:
+        ring[:, idx] = block
+        head = (head + block.shape[1]) % NFFT
 
-threading.Thread(target=reader, daemon=True).start()
+Stream(on_audio=on_audio)
 
 win = np.hanning(NFFT)
 scale = 2 / win.sum()                          # bin magnitude -> sine amplitude
@@ -79,10 +46,10 @@ ax.legend(loc="upper right", fontsize=8)
 def update(_):
     global ytop
     with lock:
-        snap = np.roll(ring, -head, axis=1).astype(np.float64)   # oldest -> newest
-    snap -= snap.mean(axis=1, keepdims=True)   # remove DC offset
+        snap = np.roll(ring, -head, axis=1)   # oldest -> newest
+    snap = snap - snap.mean(axis=1, keepdims=True)   # remove DC offset
     mag = np.abs(np.fft.rfft(snap * win, axis=1)) * scale
-    db = 20 * np.log10(mag / FULL_SCALE + 1e-12)
+    db = 20 * np.log10(mag + 1e-12)
     for ln, d in zip(lines, db):
         ln.set_ydata(d)
 
