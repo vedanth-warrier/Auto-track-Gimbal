@@ -6,7 +6,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 import matplotlib.animation as animation
 
-PORT = "/dev/cu.usbmodem101"
+PORT = "/dev/cu.usbmodem2101"
 RATE = 16000
 SHIFT = 8
 BLK = 2048

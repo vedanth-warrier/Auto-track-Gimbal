@@ -17,6 +17,12 @@
 - Stereo frame order per bus: column 0 = left, column 1 = right.
 - Pins to avoid: GPIO0, 19, 20 (USB), 21 (LED), 45, 46. GPIO3 is a strapping pin and is in use; move it if boot is erratic.
 
+### Hardware handling
+- Unplug the ESP32's USB before plugging, unplugging or swapping mics or wires. SCK/WS run whenever the firmware runs, so a mic that loses VDD/GND before its clock pins gets back-powered through them (latch-up or damage risk).
+- Close any script holding the serial port first.
+- Touch something grounded before handling mic modules (ESD).
+- 2026-10-15: two mic modules stopped outputting after being unplugged with the board powered. Cause not confirmed (bad joint, latch-up, ESD or damage).
+
 ## Toolchain
 - Arduino framework (arduino-esp32 2.0.17) via PlatformIO, platform `espressif32@7.1.3`. Switched from MicroPython 2026-10-15.
 - `pio` lives at `~/.platformio/penv/bin/pio` (installed by the VS Code extension), not on PATH.
@@ -26,11 +32,11 @@
 
 ## Layout
 - `platformio.ini`: one env per board program (`mic`, `servo`), selected with `build_src_filter`.
-- `src/mic.cpp`: reads both I2S buses (legacy `driver/i2s.h`). Per packet: writes `SYNC` + bus A block + bus B block, then `DIRV` + 4 band-RMS amplitudes + vector x, y (float32 LE, 28 bytes). Amplitude = RMS in `BAND_LO..BAND_HI` from a 1024-point ESP-DSP FFT. Vector = amplitude-weighted mean of mic facing directions (`AZ_DEG`), length 0..1.
+- `src/mic.cpp`: reads both I2S buses (legacy `driver/i2s.h`). Per packet (62.5/s): writes `SYNC` + bus A block + bus B block, then `DIRV` + 4 amplitudes + x + y + f0 + harmonics used (8 float32 LE, 36 bytes). Harmonic method: 1024-point ESP-DSP FFT per mic; pitch from the loudest peak tried as harmonic 1..6, accepted if at least 60% of its first 10 harmonics clear the local noise floor + 10 dB; then each harmonic of f0 inside `BAND_LO..BAND_HI` gives a per-mic comparison, combined weighted by harmonic amplitude. Fewer than 3 in-band harmonics -> all zeros. Pitched sounds only, by design.
 - `src/servo.cpp`: servo test on GPIO12 (LEDC PWM, 50 Hz, 600 to 2400 us).
 - `host/plot.py`: Mac script. Background thread reads the serial port and resyncs on `SYNC`. Plots a live FFT spectrum per mic (2048-point, Hann window, dBFS, 0 to 8 kHz), all 4 overlaid.
 - `host/peak.py`: Mac script. FFT every packet (62.5/s); picks the loudest bin above 100 Hz across all 4 mics and plots each mic's dBFS at that bin over the last 10 s, plus the bin frequency.
-- `host/vector.py`: Mac script. Reads `DIRV` packets; bar chart of band level per mic (dBFS) and the direction vector with a 1 s trail. `AZ_DEG` must match `mic.cpp`.
+- `host/vector.py`: Mac script. Reads `DIRV` packets; bar chart of harmonic level per mic (dBFS), the direction vector with a 1 s trail, f0 and harmonic count. `AZ_DEG` must match `mic.cpp`.
 - `host/scope.py`: Mac script. Same reader, plots 4 scrolling waveforms (min/max envelope). Use for tap tests.
 - `legacy/micropython/`: old MicroPython scripts, for reference only.
 
@@ -46,7 +52,10 @@
 - MicroPython (v1.29 generic S3) capped stdout at 11.4 KB/s, measured on the board. Likely cause: stdout duplicated to UART0 at 115200. This is why we switched.
 - Stereo slot order (column 0 = left) was confirmed under MicroPython only. Re-check under Arduino.
 - ESP-DSP optimised FFT needs 16-byte aligned buffers (`__attribute__((aligned(16)))`). Unaligned gave about +24 dBFS on every mic.
-- Board band RMS verified against numpy on the same audio: 0.0000 dB max difference over 624 packets.
+- Harmonic method, tested in Python on synthetic harmonic sources (150/220/440 Hz) mixed with 15 s of real room noise (band RMS about -61 dBFS): false detections on room noise alone 1.9% of packets; detection 41-82% at -40 dBFS source, 82-90% at -30, 99-100% at -20; x within 0.01 of truth at -20 dBFS. Synthetic only; not yet tested with a real sound source.
+- 2026-11-04: mic 4 (new module) has a flat broadband noise floor about -41 dB per bin from 0.5 to 8 kHz: +12.5 dB above the others at 2-4 kHz, +18 at 4-6, +24 at 6-8. No bit errors or glitches, so not a data-wiring fault. Module or its VDD/GND wiring; swap test not done yet.
+- Global-median threshold (first version) gave 85% false detections on room noise. Peaks must be judged against a local floor.
+- Arduino defines `BIN` as a macro (Print.h). Don't use it as a name.
 - Data layout: 24-bit samples left-justified in 32-bit words, so `>> 8` on the Mac. SPH0645-type mics may need 7 or 9.
 - USB stream: measured 256.5 KB/s, 62.51 packets/s (16.0 kHz) under Arduino, 20 s steady state after draining the start-up backlog.
 - DTR/RTS on the USB port drive the chip's reset/boot lines. Open the port with `dtr = rts = False` (as `plot.py` does) or the board can drop into the bootloader.
@@ -68,4 +77,5 @@
 - Directivity sweep per shrouded mic to pick the FFT band, then set `BAND_LO`/`BAND_HI` in `mic.cpp`.
 - Set `AZ_DEG` in `mic.cpp` and `vector.py` to the real mic layout (placeholder: 0, 90, 180, 270).
 - Per-mic gain calibration, into `GAIN` in `mic.cpp`.
+- Mic 4 noise: swap its module with mic 2 (USB unplugged). Noise follows module -> replace it; stays in position -> check mic 4's VDD/GND jumpers.
 - Map vector to gimbal angles (needs the directivity data); add a level gate so silence doesn't steer.
