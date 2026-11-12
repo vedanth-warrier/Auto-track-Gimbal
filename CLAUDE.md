@@ -14,11 +14,17 @@
 
 ### Mic wiring
 - Bus A (I2S0): SCK GPIO5, WS GPIO6, SD GPIO3. Mic 1 (L/R = 3V3, right), mic 2 (L/R = GND, left)
-- Bus B (I2S1): SCK GPIO8, WS GPIO7, SD GPIO4. Mic 3 (L/R = 3V3, right), mic 4 (L/R = GND, left)
+- Bus B (I2S1): SCK GPIO8, WS GPIO12 (moved from GPIO7 2026-11-12: GPIO7 joint failed continuity), SD GPIO4. Mic 3 (L/R = 3V3, right), mic 4 (L/R = GND, left)
 - Stereo frame order per bus: column 0 = left, column 1 = right. Confirmed under Arduino by tap test, 2026-11-04.
 - Mic facing directions (`AZ_DEG`, degrees around the vertical, anticlockwise from above): mic 1 = 90, mic 2 = 180, mic 3 = 0, mic 4 = 270. Must match in `mic.cpp` and `vector.py`.
 - SCK runs at 2.048 MHz at 32 kHz (64 clocks per frame). Jumper wiring into the shroud.
 - Pins to avoid: GPIO0, 19, 20 (USB), 21 (LED), 45, 46. GPIO3 is a strapping pin and is in use; move it if boot is erratic.
+
+### Servos (gimbal)
+- 2x FS90MR continuous rotation (no position feedback), 5 V from the laptop. Pan GPIO10 (about the vertical, ±90 from centre), elevation GPIO11 (0 = plate facing the horizon = bottom of travel, 90 = facing up). Quarter sphere.
+- Plate facing the horizon: mic 2 up, mic 3 down, mic 4 / mic 1 at the sides. Pan FORWARD (pulse > 1500) turns towards mic 4; elevation FORWARD towards mic 2.
+- No hard stops yet: the servos free-spin and pull the wires past the ends.
+- Gearing: elevation via a 5:1 worm gear with consistent slack on direction changes (zeroed with the slack taken up for moving up); pan geared lower than 5:1. Usable pulse offsets 300-800 us.
 
 ### Hardware handling
 - Unplug the ESP32's USB before plugging, unplugging or swapping mics or wires. SCK/WS run whenever the firmware runs, so a mic that loses VDD/GND before its clock pins gets back-powered through them (latch-up or damage risk).
@@ -38,16 +44,19 @@
   - `mic`: the tracker.
   - `mic_test`: same code, but the mic input is replaced by a synthetic 7 kHz sine (mic 1 at 2x the others). Every output is known exactly; use it to check the pipeline after code changes.
   - `mic_timing`: `mic_test` plus per-stage microseconds in `amp[0..2]` (append, spectra, whole loop body).
-  - `servo`: servo test on GPIO12.
+  - `servo`: servo oscillation test (`src/servo.cpp`, GPIO10).
+  - `servo_ctl`: servo controlled from the Mac (`src/servo_ctl.cpp` + `host/servo_gui.py`).
 - `src/mic.cpp`: 32 kHz, packets of 256 samples per mic (8 ms, 125/s).
   - Raw audio streamed as int16 (top 16 bits of the 24-bit sample).
   - 2048-point Hann FFT (15.6 Hz bins; 7 kHz = bin 448). Mics FFT'd in pairs (real + imaginary) and separated, so 2 FFTs per packet; only bins within +/- `FLOOR_HZ` of the tone are kept.
   - Tone: strongest bin of the summed spectra within `TONE_HZ` +/- `TONE_TOL_HZ`, at least `DETECT_DB` (12) above the median within +/- 1 kHz, for `MIN_RUN` (6) packets in a row within +/- 2 bins. Otherwise the DIRV packet is zeroed.
   - Per-mic amplitude = power in the peak bin +/- 1 (all of an on-bin tone's energy with Hann), gain corrected, as RMS. Vector = amplitude-weighted mean of the mic facing directions.
-- `src/servo.cpp`: servo test on GPIO12 (LEDC PWM, 50 Hz, 600 to 2400 us).
+- `src/servo.cpp`: oscillation test for the FS90MR on GPIO10 (GPIO12 is now bus B WS: never drive it), from every boot: left for `A_MS`, pause, right for `A_MS`, repeat. Raise `A_MS` until each swing is 90 deg. LED red = left, blue = right. Pins verified 2026-11-12 by pad readback (1198/1799 us, 20.0 ms period on both). No serial output: see Known issues.
+- `src/servo_ctl.cpp`: two FS90MR (servo 1 GPIO10, servo 2 GPIO11) driven over serial: `F<n> <us>` forward, `R<n> <us>` reverse (n = 1 or 2, offset from 1500, 0-800), `S` stops both; replies `OK <n> <pulse>`. One servo runs at a time. Stops if no command for 300 ms. LED green = forward, blue = reverse.
 - `host/stream.py`: shared serial reader. Finds the port (`/dev/cu.usbmodem*`), opens it with DTR/RTS low, parses packets, calls `on_audio` / `on_dir`. The packet format lives here and in `mic.cpp` only.
 - Packet: `SYNC` + bus A (1024 B) + bus B (1024 B, each 256 stereo frames int16 [left, right]) + `DIRV` + 8 float32 (4 amplitudes, x, y, tone Hz, SNR dB). 2088 bytes, little-endian.
 - `host/vector.py`: tone level bars per mic, raw and smoothed vector (`TAU`), `SCALE` display gain, angle in the title. `WEIGHTS` (mic 1..4) multiply the board's per-mic levels and the vector is recomputed on the Mac, for trial-and-error tuning without reflashing; all 1 = the board's own vector.
+- `host/servo_gui.py`: servo control window for `servo_ctl`: SERVO 1 / SERVO 2 select buttons (switching stops both), hold FORWARD / REVERSE, speed slider + text box (us from neutral). `FORWARD_SIGN` per servo. Resends every 0.1 s while held; shows the board's reply.
 - `host/plot.py`: live spectrum per mic (4096-point, dBFS, 0 to 16 kHz).
 - `host/peak.py`: level of the loudest bin per mic over 10 s, plus its frequency.
 - `host/scope.py`: 4 scrolling waveforms (min/max envelope). Use for tap tests.
@@ -56,6 +65,7 @@
 
 ## Workflow (important)
 - Flash: `~/.platformio/penv/bin/pio run -e mic -t upload` (or `-e mic_test`, `-e servo`).
+- The VS Code PlatformIO Upload button flashes `default_envs` in the root `platformio.ini` (set to `servo_ctl` 2026-11-12; was `mic`). It never flashes `tdoa/`: use the terminal for that.
 - Then: `uv run host/vector.py` (or another host script).
 - One program holds the serial port at a time. Close plots before uploading or running another script.
 - Upload sometimes fails with "chip stopped responding" while the board is streaming. Run it again.
@@ -73,6 +83,8 @@
 - 440 Hz sawtooth sweeps (16 kHz, harmonic method, 2026-11-04): per-mic level change with direction +/-0.6 to 2.2 dB; at 7040 Hz +/-2.2 dB with all 4 mics agreeing within 18 deg on a common offset of -131 deg from `AZ_DEG`. To be re-measured at 7 kHz with the tone tracker.
 - ESP-DSP optimised FFT needs 16-byte aligned buffers (`__attribute__((aligned(16)))`). Unaligned gave about +24 dBFS on every mic.
 - Arduino defines `BIN` as a macro (Print.h). Don't use it as a name.
+- USB serial (HWCDC, core 2.0.17): never call `Serial.setTxTimeoutMs(0)`. Its retry counter starts at the timeout and is decremented before the zero check, so 0 wraps and a write blocks ~49 days whenever the Mac is plugged in but no program reads the port (ring buffer 256 B fills). Hit 2026-11-12 in servo.cpp: servo kept turning at the last pulse. Default (100 ms) times out instead.
+- Onboard WS2812 (GPIO21) has red and green swapped vs `neopixelWrite(pin, r, g, b)`.
 - Bus A and bus B have separate SCK/WS: arbitrary phase offset between buses at each boot (unverified). Irrelevant for amplitude comparison.
 - MicroPython (v1.29 generic S3) capped stdout at 11.4 KB/s, measured on the board. This is why we switched.
 - DTR/RTS on the USB port drive the chip's reset/boot lines. `stream.py` opens with them low; any other script must too.
@@ -92,4 +104,4 @@
 ## Open actionables
 - Real-tone check in `vector.py` (detection, SNR, vector direction per mic).
 - 8-direction directivity sweep at 7 kHz.
-- Servo loop: map vector to gimbal angles, deadband (about 4-5 deg), port the `vector.py` smoothing to the board.
+- Gimbal (`tdoa/src/gimbal.cpp`): `tdoa/host/gimbal_cal.py --write` (easy angles: elevation 0/90, pan -90/+90), reflash, real-tone test with `gimbal_view.py`. Then hard stops + re-homing against them.

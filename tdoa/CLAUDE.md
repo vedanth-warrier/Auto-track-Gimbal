@@ -5,7 +5,7 @@ See `README.md` for layout, commands and measured results. The parent `CLAUDE.md
 
 ## Non-obvious facts
 - Bus B is synced by routing I2S0's SCK/WS output signals (read back from `GPIO.func_out_sel_cfg[5/6]`) to
-  GPIO8/7 and running I2S1 as an RX slave on those pins. Start order: stop both, start slave, start master.
+  GPIO8/12 (WS moved from GPIO7 2026-11-12) and running I2S1 as an RX slave on those pins. Start order: stop both, start slave, start master.
 - I2S1 slave must have its SCK input inverted (`esp_rom_gpio_connect_in_signal(8, I2S1I_BCK_IN_IDX, true)`) and
   its words shifted `<< 1`. Without the inversion it slipped one bit partway through each sample (slip
   position moved with mclk_multiple; 1024x behaved like 384x). With it: 100% bit match in the sync test.
@@ -54,7 +54,7 @@ See `README.md` for layout, commands and measured results. The parent `CLAUDE.md
   2026-11-07 (interim); any MIC_SLOT change must move MIC_DELAY_US with it, then recalibrate.
 - The main (amplitude) firmware src/mic.cpp and host/stream.py outside tdoa/ still hard-code the old order.
 
-- Servos 2026-11-09: FS90MR continuous rotation, pan GPIO12 / tilt GPIO13 (13 assumed). Velocity-mode controller
+- Servos 2026-11-09: FS90MR continuous rotation, pan GPIO10 (moved from 12 on 2026-11-12: GPIO12 is now bus B WS) / tilt GPIO13 (13 assumed). Velocity-mode controller
   on the board; board == Python ServoCtl exactly on tdoa_sim (rates, pulses, moving flag). Packet 4 + 32 floats.
   Host commands parsed in readCommands(). Not yet calibrated or run on the real gimbal.
 
@@ -69,10 +69,50 @@ See `README.md` for layout, commands and measured results. The parent `CLAUDE.md
 - Fundamental fix if excursions stay large near the axis: multi-tone or narrowband-noise beacon (reflection nulls
   land in different places per frequency), or absorbent material near the array.
 
+- Gimbal firmware 2026-11-12: `src/gimbal.cpp` (copy of main.cpp's pipeline + gimbal control; main.cpp untouched,
+  envs pick one file via build_src_filter) and `src/gimbal_config.h`. User's spec: pan GPIO10 about the vertical,
+  ±90 from centre; elevation GPIO11, 0 = plate facing the horizon (bottom, home) to 90 = facing up (quarter sphere).
+  Plate facing the horizon: mic 2 up, mic 3 down, mic 4 / mic 1 at the sides. Pan FORWARD (pulse > 1500, servo_gui
+  FORWARD) turns towards mic 4, elevation FORWARD towards mic 2. Tone lost -> search (user's choice: sweep).
+  Servos free-spin and pull the wires past the ends (hard stops to come); powered from the laptop's 5 V.
+- Aim uses the source's angle relative to the plate, NOT a world-frame target from the dead-reckoned pose: world
+  targets flipped over the zenith once the elevation estimate drifted (pan oscillated ±30 deg in the sim).
+- Tone lost: holds position (GIMBAL_SEARCH_ENABLE 0, user's choice 2026-11-12). Search, if enabled = 3 listening stops (pan -45/0/+45, el 30), not end-to-end sweeps: full sweeps tripled the drift.
+- gimbal_sim results and drift (~4 % of travel with assumed 3-5 % speed errors) in README "Measured".
+- No way to sense a stall: the servo's supply doesn't pass through the board. Options: current shunt or INA219
+  per servo, or (planned) timed homing into hard stops.
+- HWCDC: gimbal.cpp writes only if `!Serial` or availableForWrite() >= packet, so it never blocks with no reader
+  (tested: port closed 8 s, 0 re-syncs).
+
+- Elevation worm-gear slack (user 2026-11-12): consistent, only on direction changes; home zeroed with the slack
+  taken up for moving UP. Modelled in the dead reckoning (motor side motT, plate moves once outside the gap).
+  The elevation speed tables measured before 2026-11-12 crossed the slack on every run (cal alternates
+  directions), so they read low: redo with `gimbal_cal.py --axis tilt` (now takes up the slack first).
+- Deadband: START 20 / STOP 20 deg on the total pointing error (user 2026-11-12; earlier 10 / 4, 4 / 2).
+- Calibration is easy-angle only (user has no protractor): gimbal_cal.py, elevation 0 <-> 90, pan -90 <-> +90;
+  first move board-timed (NP/NT command), user fine-adjusts; least squares 90 = k*counted - slack*crossed.
+  gimbal_backlash.py and gimbal_travel.py were removed (needed arbitrary angle readings).
+- User's calibration 2026-11-12: slowest speeds (300 us) are 93-141 deg/s elevation, 105-133 pan, all above
+  GIMBAL_MAX_DPS 60 and the jog's 30: tracking and jogging ONLY use the CAL_US[0] entries. Elevation cal runs were
+  0.2-0.65 s with round-number angles; backlash fit down 32 vs up 20 deg (mean 25.5 written). User then saw the
+  estimate read ~50 at a true 90 jogging up from home: cause not confirmed (coarse short-run readings most
+  likely; GUI resend gaps possible: gimbal_view now counts jog drop-outs). gimbal_travel.py (removed) measured CAL_US[0]
+  speeds over the full travel with counted moves. Jog has no limits (user: needed for calibration).
+
 ## Open
+- Gimbal: gimbal_cal.py --write (easy angles), reflash, then a real-tone test with gimbal_view.py. Not run on hardware yet. Then hard stops + re-homing against them.
 - jumps.py recordings: (a) source still on a stand at 3-4 known positions (ground truth), (b) slow movement within
   ~25 deg of the axis (gimbal regime).
 - servotest.py --write on the gimbal, reflash, then E1 (auto) with a tone.
 - Circle test in step mode, twice in the same place, once moved; --compare to classify the 6 deg wobble.
 - Tap test with `host/scope.py`; clap tests with `gcc.py` from known directions.
 - Real 7.5 kHz tone test with `view.py` / `livecheck.py`.
+
+- 2026-11-12: mics 3 and 4 (bus B, GPIO4 data) read exactly 0 on both slots; bus A normal (0.3 spikes/s), packets
+  125/s, 0 re-syncs (so the bus B clocks reach the I2S1 slave through the GPIO7/8 pads). With GPIO4 pulled up
+  (env `tdoa_sdpullup`) bus B read all -1: nothing drives the data line, and GPIO4 is not shorted. Fault is off
+  the chip, on what mics 3/4 share: SD wire (GPIO4), SCK (GPIO8) or WS (GPIO7) wire/joint, or their power feed;
+  or both mics dead. Happened after the servo tests on this board (wires moved around the header). Unresolved.
+  Then: user found the GPIO7 WS joint failed continuity and moved bus B WS to GPIO12 (main.cpp, root mic.cpp;
+  TDOA_PAN_PIN moved 12 -> 10). Sync test PASS on GPIO12 (offset 0, 100.00%), so WS reaches the I2S1 slave
+  through the pad. Bus B still exactly 0 after that: a second fault remains between the pads and mics 3/4.

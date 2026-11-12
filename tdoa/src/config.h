@@ -51,7 +51,7 @@ static const float MIC_DELAY_US[4] = {13.960f, -11.869f, 16.525f, -18.616f};
 // ---- Servos: FS90MR continuous rotation (pulse sets speed: ~1500 us = stop). No position feedback, so no
 // travel limits: the board stops them whenever the track is lost. Calibrate with host/servotest.py.
 #define TDOA_SERVO_ENABLE 0          // 1 = drive the servos at boot. 0 = compute and report only (enable with "E1")
-#define TDOA_PAN_PIN 12
+#define TDOA_PAN_PIN 10          // was 12; GPIO12 is bus B WS since 2026-11-12
 #define TDOA_TILT_PIN 13
 #define TDOA_TILT_UP_AZ_DEG 59.5f    // array-frame direction that tilting up moves the pointing towards (mic 3)
 #define TDOA_PAN_SIGN 1              // +1 / -1: flip if that servo turns away from the source (servotest.py checks)

@@ -173,7 +173,7 @@ void setup() {
   Serial.setTxBufferSize(16384);
   Serial.begin();
   startBus(I2S_NUM_0, 5, 6, 3);  // bus A: mics 1, 2
-  startBus(I2S_NUM_1, 8, 7, 4);  // bus B: mics 3, 4
+  startBus(I2S_NUM_1, 8, 12, 4);  // bus B: mics 3, 4 (WS on GPIO12 since 2026-11-12)
 
   dsps_fft2r_init_fc32(nullptr, NFFT);
   dsps_wind_hann_f32(win, NFFT);

@@ -1,7 +1,7 @@
 // TDOA tone tracker.
 //
 // Capture: I2S0 is the clock master on bus A (SCK 5, WS 6, SD 3). Its SCK/WS output signals are also routed,
-// through the GPIO matrix, to bus B's clock pins (SCK 8, WS 7), and I2S1 runs as a slave on those pins
+// through the GPIO matrix, to bus B's clock pins (SCK 8, WS 12), and I2S1 runs as a slave on those pins
 // (SD 4). All 4 mics are therefore clocked and sampled on the same edges. Both receivers are started
 // slave-first so their DMA streams begin on the same frame; any DMA overflow triggers a re-sync.
 //
@@ -161,7 +161,7 @@ static void resync() {
 }
 
 static void startCapture() {
-  installBus(I2S_NUM_1, false, 8, 7, 4, &qB);  // slave on bus B pins; waits for clocks
+  installBus(I2S_NUM_1, false, 8, 12, 4, &qB);  // slave on bus B pins (WS on GPIO12 since 2026-11-12); waits for clocks
 #ifdef SYNC_TEST
   esp_rom_gpio_connect_in_signal(3, I2S1I_SD_IN_IDX, false);  // bus B receiver reads bus A's data line
 #endif
@@ -170,14 +170,18 @@ static void startCapture() {
   uint32_t bckSig = GPIO.func_out_sel_cfg[5].func_sel;
   uint32_t wsSig = GPIO.func_out_sel_cfg[6].func_sel;
   gpio_set_direction(GPIO_NUM_8, GPIO_MODE_INPUT_OUTPUT);  // keeps the slave's input routing on the pad
-  gpio_set_direction(GPIO_NUM_7, GPIO_MODE_INPUT_OUTPUT);
+  gpio_set_direction(GPIO_NUM_12, GPIO_MODE_INPUT_OUTPUT);
   esp_rom_gpio_connect_out_signal(8, bckSig, false, false);
-  esp_rom_gpio_connect_out_signal(7, wsSig, false, false);
+  esp_rom_gpio_connect_out_signal(12, wsSig, false, false);
   // The slave detects SCK edges a few module-clock cycles late, which put its sampling point right on the
   // mics' data transitions (falling SCK edge): bits slipped mid-sample. Inverting its SCK input moves the
   // sampling point half a bit away, into the stable part of each bit. It then reads every bit one position
   // late, which appendSamples undoes with << 1 (sync test: 100% of data bits match bus A after the shift).
   esp_rom_gpio_connect_in_signal(8, I2S1I_BCK_IN_IDX, true);
+#ifdef SD_PULLUP
+  gpio_pulldown_dis(GPIO_NUM_4);  // wiring check: an undriven bus B data line now reads all 1s (-1), not 0
+  gpio_pullup_en(GPIO_NUM_4);
+#endif
   resync();
   resyncs = 0;
 }
