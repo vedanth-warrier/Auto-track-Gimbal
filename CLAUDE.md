@@ -21,9 +21,9 @@
 - Pins to avoid: GPIO0, 19, 20 (USB), 21 (LED), 45, 46. GPIO3 is a strapping pin and is in use; move it if boot is erratic.
 
 ### Servos (gimbal)
-- 2x FS90MR continuous rotation (no position feedback), 5 V from the laptop. Pan GPIO10 (about the vertical, ±90 from centre), elevation GPIO11 (0 = plate facing the horizon = bottom of travel, 90 = facing up). Quarter sphere.
+- 2x FS90MR continuous rotation (no position feedback). Servos powered from their own laptop USB port, separate from the ESP32's port (grounds still common through the laptop and the signal ground). Pan GPIO10 (about the vertical, ±90 from centre), elevation GPIO11 (0 = plate facing the horizon = bottom of travel, 90 = facing up). Quarter sphere.
 - Plate facing the horizon: mic 2 up, mic 3 down, mic 4 / mic 1 at the sides. Pan FORWARD (pulse > 1500) turns towards mic 4; elevation FORWARD towards mic 2.
-- No hard stops yet: the servos free-spin and pull the wires past the ends.
+- Hard stops fitted 2026-11-15 (no limit switches). The gimbal firmware has no position estimate: it steers from the mic error only.
 - Gearing: elevation via a 5:1 worm gear with consistent slack on direction changes (zeroed with the slack taken up for moving up); pan geared lower than 5:1. Usable pulse offsets 300-800 us.
 
 ### Hardware handling
@@ -104,4 +104,4 @@
 ## Open actionables
 - Real-tone check in `vector.py` (detection, SNR, vector direction per mic).
 - 8-direction directivity sweep at 7 kHz.
-- Gimbal (`tdoa/src/gimbal.cpp`): `tdoa/host/gimbal_cal.py --write` (easy angles: elevation 0/90, pan -90/+90), reflash, real-tone test with `gimbal_view.py`. Then hard stops + re-homing against them.
+- Gimbal (`tdoa/src/gimbal.cpp`): real-tone test with `tdoa/host/gimbal_view.py` (AUTO), tune `tdoa/src/gimbal_config.h`.

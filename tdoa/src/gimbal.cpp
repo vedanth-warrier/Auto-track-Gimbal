@@ -2,19 +2,19 @@
 // continuous-rotation servos: pan (GPIO10, about the vertical) and elevation (GPIO11). Settings: gimbal_config.h.
 //
 // Per 8 ms packet: capture, spectra, tone detection, TDOA direction and tracker as in main.cpp, then:
-//   - motion compensation: each direction estimate is rotated by the gimbal's own motion over the estimation lag
-//     (GIMBAL_EST_LAG_PKTS), and the tracker's state turns with the plate every packet, so the gimbal turning
-//     doesn't look like the source moving
-//   - tracking: the source's angle off the plate axis, split into elevation (towards mic 2) and pan (towards mic 4)
-//     parts, gives the pose error; speed = GIMBAL_GAIN x pose error, capped, acceleration-limited, each axis with
-//     start/stop hysteresis, clipped to the travel limits minus GIMBAL_LIMIT_MARGIN_DEG
-//   - tone lost: hold position (GIMBAL_SEARCH_ENABLE 0), or hold, then search: listen at 3 pan stops in turn
-//     (servos stopped), then park at the centre
-//   - pose = dead reckoning (speed x time, speeds from the measured tables): no position feedback, so it drifts.
-//     Elevation includes the worm gear's slack (GIMBAL_TILT_BACKLASH_DEG) on direction changes
-//   - speed -> pulse through the speed tables. Below the slowest calibrated speed an axis runs at that speed or
-//     gets no pulses at all (a stopped servo can't creep)
-// Packet: as main.cpp ("SYNC" + audio + "TDOA" + 32 floats) + "GMBL" + 24 floats (GimbalPacket). The TDOA host
+//   - pointing error from the mics only: the tracked direction's angle off the plate axis towards mic 2 is the
+//     elevation error, towards mic 4 the pan error. No position estimate: travel is limited by hard stops.
+//   - deadband: start moving once the total error exceeds GIMBAL_START_DEG, stop once it's under GIMBAL_STOP_DEG
+//   - look, move, look: each axis with more than GIMBAL_AXIS_MIN_DEG of error is driven towards zero in a burst
+//     of at most GIMBAL_MOVE_S (pulse offset from neutral = MIN_US + US_PER_DEG x its error, capped at MAX_US),
+//     then the servos stop for GIMBAL_SETTLE_S while the (lagging) mic estimate catches up. Stopped servos get no
+//     pulses (no creep).
+//   - quiet-only estimates: while any servo gets pulses and for GIMBAL_QUIET_GAP_S after, the tracker is frozen
+//     (servo noise measured +34 to +61 dB in the tone band); the settle counts quiet time only
+//   - tone lost: stop and hold
+//   - hard stops: an axis whose error didn't shrink by GIMBAL_STALL_DEG over a burst + settle is against a stop;
+//     that direction is blocked until the beacon needs the other way
+// Packet: as main.cpp ("SYNC" + audio + "TDOA" + 32 floats) + "GMBL" + 18 floats (GimbalPacket). The TDOA host
 // scripts still read it (they skip the extra block); host/gstream.py reads both.
 // When no program is reading the USB port, packets are dropped instead of blocking, so it runs without a host.
 // gimbal_sim: closed-loop simulation (see simulate()); never drives the servo pins.
@@ -114,23 +114,19 @@ static_assert(sizeof(TdoaPacket) == 4 + 32 * 4, "no padding: host/tstream.py rea
 
 struct GimbalPacket {
   char tag[4];            // "GMBL"
-  float mode;             // 0 off (no pulses), 1 automatic, 2 jog, 3 raw pulses (calibration)
-  float state;            // 0 idle, 1 tracking, 2 holding (tone lost, waiting), 3 searching, 4 parked
-  float pan, tilt;        // estimated pose, deg (dead reckoning from home). + pan = FORWARD (towards mic 4)
-  float panRate, tiltRate;  // deg/s the pulses give (speed tables), + = FORWARD
+  float mode;             // 0 off (no pulses), 1 automatic, 2 jog
+  float state;            // 0 idle, 1 tracking, 2 holding (no usable direction: stopped)
+  float errPan, errTilt;  // pointing error from the mics, deg: + = that axis needs to go FORWARD (mic 4 / mic 2)
+  float err;              // total pointing error, deg
+  float moving;           // 1 = outside the deadband, driving
   float panUs, tiltUs;    // pulses sent, us (0 = none)
-  float tgtPan, tgtTilt;  // pose being driven to, deg (inside the limits)
-  float errPan, errTilt;  // pointing error per axis, deg (pan part scaled by cos elevation)
-  float srcAz, srcEl;     // source direction in the world (deg), from the track and the estimated pose
-  float limits;           // target clipped: 1 pan min, 2 pan max, 4 tilt min, 8 tilt max
-  float calibrated;       // GIMBAL_CALIBRATED: automatic mode is refused until the speed tables are measured
-  float searchPass;       // sweeps done in the current search
+  float blocked;          // directions blocked by a hard stop: 1 pan FORWARD, 2 pan REVERSE, 4 elev UP, 8 elev DOWN
   float txDrops;          // packets dropped because no program was reading the USB port
   float simT, simPan, simTilt, simSrcAz, simSrcEl, simTone;  // gimbal_sim truth (true pose, world source), else 0
-  float tiltSlack;        // elevation slack still to cross before the plate moves DOWN: 0 = engaged downwards,
-                          // GIMBAL_TILT_BACKLASH_DEG = engaged upwards (as at home)
+  float simPush;          // gimbal_sim: s spent driving an axis into a hard stop
+  float listening;        // 1 = servos quiet long enough: mic estimates are used; 0 = tracker frozen
 };
-static_assert(sizeof(GimbalPacket) == 4 + 25 * 4, "no padding: host/gstream.py reads 4 + 25 floats");
+static_assert(sizeof(GimbalPacket) == 4 + 18 * 4, "no padding: host/gstream.py reads 4 + 18 floats");
 
 // ---------------------------------------------------------------- capture
 
@@ -501,18 +497,12 @@ static void trackStep(bool have, const float u[3], float quality, TdoaPacket &pk
   }
 }
 
-// ---------------------------------------------------------------- gimbal geometry
-// Array-frame vectors are handled as components along U (MIC_POS azimuth GIMBAL_UP_AZ_DEG, mic 2: the way elevation
-// FORWARD swings the axis), L (GIMBAL_PANFWD_AZ_DEG, mic 4: the way pan FORWARD swings it) and the axis A (+z). Only
-// dot products with these are used, so it doesn't matter whether MIC_POS's frame is mirrored.
-// World frame: x = the axis at home (pan 0, plate facing the horizon), z = up, y = where pan FORWARD swings the axis
-// from home. At pan p, elevation e the plate's directions in world coordinates are
-//   A = (cos e cos p, cos e sin p, sin e),  U = (-sin e cos p, -sin e sin p, cos e),  L = (-sin p, cos p, 0)
-// (elevation turns the plate about L, pan about the vertical).
+// ---------------------------------------------------------------- gimbal
+// Array-frame directions: U (MIC_POS azimuth GIMBAL_UP_AZ_DEG, mic 2) is where elevation FORWARD swings the axis,
+// L (GIMBAL_PANFWD_AZ_DEG, mic 4) where pan FORWARD swings it, A (+z) the axis. Only dot products with these are
+// used, so it doesn't matter whether MIC_POS's frame is mirrored.
 
 static const float D2R = (float)PI / 180, R2D = 180 / (float)PI;
-static const float P_LO = GIMBAL_PAN_MIN_DEG + GIMBAL_LIMIT_MARGIN_DEG, P_HI = GIMBAL_PAN_MAX_DEG - GIMBAL_LIMIT_MARGIN_DEG;
-static const float T_LO = GIMBAL_TILT_MIN_DEG + GIMBAL_LIMIT_MARGIN_DEG, T_HI = GIMBAL_TILT_MAX_DEG - GIMBAL_LIMIT_MARGIN_DEG;
 static float axU[3], axL[3];  // U and L in the array frame (in-plane; L made exactly perpendicular to U)
 
 static float clampf(float x, float lo, float hi) { return x < lo ? lo : x > hi ? hi : x; }
@@ -527,23 +517,208 @@ static void initAxes() {
   axL[0] = l0 / n; axL[1] = l1 / n; axL[2] = 0;
 }
 
-static void plateAxes(float pan, float el, float A[3], float Uw[3], float Lw[3]) {
-  float p = pan * D2R, e = el * D2R, cp = cosf(p), sp = sinf(p), ce = cosf(e), se = sinf(e);
-  A[0] = ce * cp; A[1] = ce * sp; A[2] = se;
-  Uw[0] = -se * cp; Uw[1] = -se * sp; Uw[2] = ce;
-  Lw[0] = -sp; Lw[1] = cp; Lw[2] = 0;
+static const int SERVO_BITS = 14;
+static const float SERVO_PERIOD_US = 20000;  // 50 Hz
+static const uint32_t JOG_TIMEOUT_MS = 300;
+// Per axis: 0 = pan, 1 = elevation (also the LEDC channel)
+static const int PIN[2] = {GIMBAL_PAN_PIN, GIMBAL_TILT_PIN};
+static const float NEUTRAL[2] = {GIMBAL_PAN_NEUTRAL_US, GIMBAL_TILT_NEUTRAL_US};
+static const float FWD_SIGN[2] = {GIMBAL_PAN_FWD_SIGN, GIMBAL_TILT_FWD_SIGN};
+static const float MIN_US[2] = {GIMBAL_PAN_MIN_US, GIMBAL_TILT_MIN_US};
+static const float US_PER_DEG[2] = {GIMBAL_PAN_US_PER_DEG, GIMBAL_TILT_US_PER_DEG};
+static const float MAX_US[2] = {GIMBAL_PAN_MAX_US, GIMBAL_TILT_MAX_US};
+
+static struct {
+  int mode = GIMBAL_ENABLE ? 1 : 0;  // 0 off (no pulses), 1 automatic, 2 jog
+  int state = 0;                     // 0 idle, 1 tracking, 2 holding (no usable direction)
+  bool moving = false;               // deadband hysteresis on the total error
+  int phase = 0;                     // 0 looking, 1 burst (driving), 2 settling (stopped, estimate catching up)
+  float phaseS = 0;                  // s in the current burst / settle
+  float err[2] = {0, 0};             // pointing error (pan, elevation), deg: + = needs to go FORWARD
+  float us[2] = {0, 0};              // pulses sent (0 = none)
+  int dir[2] = {0, 0};               // burst direction per axis: FORWARD (+1), REVERSE (-1) or not driven (0)
+  int blocked[2] = {0, 0};           // direction blocked by a hard stop, until the other way is wanted
+  float errStart[2] = {0, 0};        // |error| when the burst started (hard-stop check after the settle)
+  bool steady[2] = {false, false};   // the estimate was steady when the burst started (else no hard-stop check)
+  float blockedS[2] = {0, 0};        // s since that axis was blocked (retried after GIMBAL_BLOCK_RETRY_S)
+  float hist[16][2] = {};            // last 16 packets' errors (128 ms), to tell a steady estimate
+  int histI = 0;
+  float jog[2] = {0, 0};             // jog pulse offsets, us (+ = FORWARD)
+  uint32_t jogAt = 0;
+  uint32_t txDrops = 0;
+  float quietS = 1;                  // s since any servo last got a pulse
+} gb;
+
+static void writePulse(int ch, float us) {
+#ifndef GIMBAL_SIM  // the simulation never drives the real servos
+  ledcWrite(ch, us > 0 ? (uint32_t)(us / SERVO_PERIOD_US * ((1 << SERVO_BITS) - 1)) : 0);
+#endif
 }
 
-static void toWorld(const float v[3], float pan, float el, float w[3]) {  // array frame -> world, at pose (pan, el)
-  float A[3], Uw[3], Lw[3];
-  plateAxes(pan, el, A, Uw, Lw);
-  float cu = v[0] * axU[0] + v[1] * axU[1], cl = v[0] * axL[0] + v[1] * axL[1], ca = v[2];
-  for (int c = 0; c < 3; c++) w[c] = cu * Uw[c] + cl * Lw[c] + ca * A[c];
+// Pointing error from the tracked direction u (array frame): its angle off the axis towards L (pan) and U (elev)
+static void pointingError(const float u[3], float e[2]) {
+  e[0] = atan2f(u[0] * axL[0] + u[1] * axL[1], u[2]) * R2D;
+  e[1] = atan2f(u[0] * axU[0] + u[1] * axU[1], u[2]) * R2D;
+}
+
+// Look, move, look. Returns the pulse direction and offset per axis for this packet.
+static void autoStep(float dt, int dir[2], float off[2]) {
+  bool have = trk.state == 1 || (trk.state == 2 && trk.since < GIMBAL_COAST_STOP_S);
+  if (!have) {  // tone lost (or only poor estimates): stop and hold
+    gb.state = 2;
+    gb.moving = false;
+    gb.phase = 0;
+    return;
+  }
+  gb.state = 1;
+  pointingError(trk.o, gb.err);
+  float total = sqrtf(gb.err[0] * gb.err[0] + gb.err[1] * gb.err[1]);
+  const float *old = gb.hist[gb.histI];  // errors 16 packets ago
+  bool steadyNow[2] = {fabsf(gb.err[0] - old[0]) < 3, fabsf(gb.err[1] - old[1]) < 3};
+  gb.hist[gb.histI][0] = gb.err[0];
+  gb.hist[gb.histI][1] = gb.err[1];
+  gb.histI = (gb.histI + 1) % 16;
+  for (int a = 0; a < 2; a++)
+    if (gb.blocked[a] && (gb.blockedS[a] += dt) >= GIMBAL_BLOCK_RETRY_S) gb.blocked[a] = 0;  // try again
+  if (gb.phase != 2 || gb.quietS >= GIMBAL_QUIET_GAP_S) gb.phaseS += dt;  // settle counts quiet time only
+  if (gb.phase == 2) {  // settling: wait for the estimate to catch up, then check each driven axis got closer
+    if (gb.phaseS < GIMBAL_SETTLE_S) return;
+    for (int a = 0; a < 2; a++)
+      if (GIMBAL_STALL_DEG > 0 && gb.dir[a] && gb.steady[a] && gb.errStart[a] - fabsf(gb.err[a]) < GIMBAL_STALL_DEG &&
+          (gb.err[a] > 0 ? 1 : -1) == gb.dir[a]) {
+        gb.blocked[a] = gb.dir[a];  // pushed without getting closer: against a hard stop
+        gb.blockedS[a] = 0;
+      }
+    gb.phase = 0;
+  }
+  if (!gb.moving && total > GIMBAL_START_DEG) gb.moving = true;
+  if (gb.moving && total < GIMBAL_STOP_DEG) gb.moving = false;
+  for (int a = 0; a < 2; a++)  // the beacon needs the other way now: unblock
+    if (gb.blocked[a] && (gb.err[a] > 0 ? 1 : -1) != gb.blocked[a]) gb.blocked[a] = 0;
+  if (gb.phase == 0) {  // looking: start a burst on the axes that need it
+    if (!gb.moving) return;
+    bool any = false;
+    for (int a = 0; a < 2; a++) {
+      int want = gb.err[a] > 0 ? 1 : -1;
+      gb.dir[a] = fabsf(gb.err[a]) > GIMBAL_AXIS_MIN_DEG && want != gb.blocked[a] ? want : 0;
+      gb.errStart[a] = fabsf(gb.err[a]);
+      gb.steady[a] = steadyNow[a];
+      any |= gb.dir[a] != 0;
+    }
+    if (!any) return;  // nothing an axis can do (blocked, or each axis's share too small)
+    gb.phase = 1;
+    gb.phaseS = 0;
+  }
+  // burst: drive until MOVE_S, the deadband, or an axis's error changes sign (it got there)
+  bool done = gb.phaseS >= GIMBAL_MOVE_S || !gb.moving;
+  bool any = false;
+  for (int a = 0; a < 2; a++) {
+    if (gb.dir[a] && (gb.err[a] > 0 ? 1 : -1) == gb.dir[a] && !done) {
+      dir[a] = gb.dir[a];
+      off[a] = std::min(MIN_US[a] + US_PER_DEG[a] * fabsf(gb.err[a]), MAX_US[a]);
+      any = true;
+    }
+  }
+  if (!any) {
+    gb.phase = 2;
+    gb.phaseS = 0;
+  }
+}
+
+#ifdef GIMBAL_SIM
+static void simAdvance(float dt);
+#endif
+
+static void gimbalStep(TdoaPacket &pkt, GimbalPacket &g) {
+  const float dt = TRK_DT;
+  if (gb.mode == 2 && millis() - gb.jogAt > JOG_TIMEOUT_MS) gb.mode = 0;
+  int dir[2] = {0, 0};
+  float off[2] = {0, 0};
+  if (gb.mode == 1) {
+    autoStep(dt, dir, off);
+  } else {
+    gb.state = 0;
+    gb.moving = false;
+    gb.phase = 0;
+    if (gb.mode == 2)
+      for (int a = 0; a < 2; a++)
+        if (gb.jog[a]) {
+          dir[a] = gb.jog[a] > 0 ? 1 : -1;
+          off[a] = fabsf(gb.jog[a]);
+        }
+  }
+  for (int a = 0; a < 2; a++) {
+    gb.us[a] = dir[a] ? NEUTRAL[a] + dir[a] * FWD_SIGN[a] * off[a] : 0;
+    writePulse(a, gb.us[a]);
+  }
+  gb.quietS = gb.us[0] || gb.us[1] ? 0 : gb.quietS + dt;
+#ifdef GIMBAL_SIM
+  simAdvance(dt);
+#endif
+  g.mode = gb.mode; g.state = gb.state; g.errPan = gb.err[0]; g.errTilt = gb.err[1];
+  g.err = sqrtf(gb.err[0] * gb.err[0] + gb.err[1] * gb.err[1]);
+  g.moving = gb.moving; g.panUs = gb.us[0]; g.tiltUs = gb.us[1];
+  g.blocked = (gb.blocked[0] == 1 ? 1 : 0) | (gb.blocked[0] == -1 ? 2 : 0) | (gb.blocked[1] == 1 ? 4 : 0) |
+              (gb.blocked[1] == -1 ? 8 : 0);
+  g.txDrops = gb.txDrops;
+  g.listening = gb.quietS >= GIMBAL_QUIET_GAP_S;
+  pkt.panRate = pkt.tiltRate = 0;
+  pkt.panUs = gb.us[0]; pkt.tiltUs = gb.us[1]; pkt.moving = gb.moving; pkt.servoMode = gb.mode;
+}
+
+// LED: off = off, bright green = moving to the beacon, dim green = on target (in the deadband), red = against a
+// hard stop, yellow = holding (tone lost), white = jog
+static void showState() {
+  static int last = -1;
+  int code = gb.mode == 0 ? 0 : gb.mode == 2 ? 5 : gb.state != 1 ? 2 : (gb.blocked[0] || gb.blocked[1]) ? 4 : gb.moving ? 1 : 3;
+  if (code == last) return;
+  last = code;
+  static const uint8_t RGB[6][3] = {{0, 0, 0}, {0, 40, 0}, {30, 30, 0}, {0, 6, 0}, {40, 0, 0}, {20, 20, 20}};
+  neopixelWrite(21, RGB[code][1], RGB[code][0], RGB[code][2]);  // this board's LED has red and green swapped
+}
+
+// ---------------------------------------------------------------- closed-loop simulation (gimbal_sim)
+#ifdef GIMBAL_SIM
+// A scripted source in the world (scenario) is heard by a simulated array on the gimbal's TRUE pose. The true gimbal
+// turns at the speed a pulse gives (SIM_DPS: roughly the speeds measured on the real gimbal 2026-11-12), has hard
+// stops at pan +-90 and elevation 0 / 90, and SIM_TILT_BACKLASH of worm-gear slack. The plate blocks sound from
+// behind. Servo spin-up and coasting aren't modelled. "R" restarts the scenario with the gimbal at home.
+// World: x = the axis at home (pan 0, plate facing the horizon), z = up, y = where pan FORWARD swings the axis.
+static const float SIM_US[3] = {300, 500, 800};
+static const float SIM_DPS[4][3] = {{133, 247, 273}, {105, 257, 258}, {61, 118, 159}, {71, 211, 223}};
+                                     // pan FORWARD, pan REVERSE, elevation UP, elevation DOWN
+static const float SIM_TILT_BACKLASH = 6.0f;
+static const float SCEN_S = 70;
+static float simT = 0, simPan = 0, simTilt = 0, simMotT = 0, simSrcAz = 0, simSrcEl = 0, simAz = 0, simEl = 0;
+static float simPush = 0;
+static bool simTone = false;
+
+static float simSpeed(int a, float us) {  // true deg/s (+ = FORWARD) for a pulse; dead below 150 us
+  if (us <= 0) return 0;
+  float off = (us - NEUTRAL[a]) * FWD_SIGN[a];
+  int d = off > 0 ? 1 : -1;
+  off = std::min(fabsf(off), 800.0f);
+  const float *t = SIM_DPS[2 * a + (d > 0 ? 0 : 1)];
+  float v = off <= SIM_US[0] ? (off < 150 ? 0 : t[0] * (off - 150) / (SIM_US[0] - 150))
+          : off <= SIM_US[1] ? t[0] + (t[1] - t[0]) * (off - SIM_US[0]) / (SIM_US[1] - SIM_US[0])
+                             : t[1] + (t[2] - t[1]) * (off - SIM_US[1]) / (SIM_US[2] - SIM_US[1]);
+  return d * v;
+}
+
+static void simAdvance(float dt) {
+  float vp = simSpeed(0, gb.us[0]), vt = simSpeed(1, gb.us[1]);
+  if ((vp > 0 && simPan >= 90) || (vp < 0 && simPan <= -90) || (vt > 0 && simMotT >= 90) ||
+      (vt < 0 && simMotT <= -SIM_TILT_BACKLASH))
+    simPush += dt;  // driving into a hard stop
+  simPan = clampf(simPan + vp * dt, -90, 90);
+  simMotT = clampf(simMotT + vt * dt, -SIM_TILT_BACKLASH, 90);  // motor side: plate stops at 0 and 90
+  if (simMotT > simTilt) simTilt = simMotT;
+  else if (simMotT < simTilt - SIM_TILT_BACKLASH) simTilt = simMotT + SIM_TILT_BACKLASH;
 }
 
 static void toArray(const float w[3], float pan, float el, float v[3]) {  // world -> array frame, at pose (pan, el)
-  float A[3], Uw[3], Lw[3];
-  plateAxes(pan, el, A, Uw, Lw);
+  float p = pan * D2R, e = el * D2R, cp = cosf(p), sp = sinf(p), ce = cosf(e), se = sinf(e);
+  float A[3] = {ce * cp, ce * sp, se}, Uw[3] = {-se * cp, -se * sp, ce}, Lw[3] = {-sp, cp, 0};
   float cu = 0, cl = 0, ca = 0;
   for (int c = 0; c < 3; c++) {
     cu += w[c] * Uw[c];
@@ -554,304 +729,30 @@ static void toArray(const float w[3], float pan, float el, float v[3]) {  // wor
   v[2] = ca;
 }
 
-static void reframe(float v[3], float pan0, float el0, float pan1, float el1) {  // a fixed world direction, as
-  float w[3];                                                                   // seen after the plate moved
-  toWorld(v, pan0, el0, w);
-  toArray(w, pan1, el1, v);
-}
-
-// ---------------------------------------------------------------- gimbal control
-
-#ifdef GIMBAL_SIM
-static const bool IS_SIM = true;
-#else
-static const bool IS_SIM = false;
-#endif
-static const bool CAN_AUTO = GIMBAL_CALIBRATED || IS_SIM;  // automatic mode needs measured speeds
-static const int SERVO_BITS = 14;
-static const float SERVO_PERIOD_US = 20000;  // 50 Hz
-static const uint32_t JOG_TIMEOUT_MS = 300, RAW_MAX_MS = 10000;
-static const int HIST = 64;                  // pose history in packets, for GIMBAL_EST_LAG_PKTS
-static_assert(GIMBAL_EST_LAG_PKTS < HIST, "pose history too short for GIMBAL_EST_LAG_PKTS");
-static float hist[HIST][2];
-
-static struct {
-  int mode = GIMBAL_ENABLE && CAN_AUTO ? 1 : 0;  // 0 off (no pulses), 1 automatic, 2 jog, 3 raw pulses
-  int state = 0;                  // 0 idle, 1 tracking, 2 holding, 3 searching, 4 parked
-  float pan = 0, el = 0;          // estimated pose, deg (dead reckoning from home)
-  float motT = 0;                 // elevation motor side, plate degrees: el - BACKLASH <= motT <= el
-                                  // (motT = el: engaged upwards, as at home)
-  float rp = 0, rt = 0;           // requested speeds after the acceleration limit, deg/s (+ = FORWARD)
-  float ep = 0, et = 0;           // speeds the pulses give (speed tables), deg/s: integrated into the pose
-  float usP = 0, usT = 0;         // pulses sent, us (0 = none)
-  bool moving = false;            // start/stop hysteresis on the total pointing error
-  bool movP = false, movT = false;  // which axes are driving
-  float lostFor = 0;              // s since the track was lost
-  float jogP = 0, jogT = 0;       // jog speeds, deg/s
-  uint32_t jogMs = JOG_TIMEOUT_MS;  // jog stops this long after the last jog command
-  float rawP = 0, rawT = 0;       // raw pulse offsets from neutral, us
-  uint32_t cmdAt = 0;             // millis() of the last jog / raw command
-  uint32_t rawMs = RAW_MAX_MS;    // raw pulses stop this long after the last raw command
-  float tgtP = 0, tgtT = 0, errP = 0, errT = 0;
-  float srcAz = 0, srcEl = 0;     // last source direction in the world, deg
-  int limits = 0;
-  int wp = 0, wpDir = 1, passes = 0;  // search: current stop, direction, sweeps done
-  float dwell = 0;
-  uint32_t txDrops = 0;
-} gb;
-
-// Pulse offset (us) for a wanted speed (deg/s, >= 0) from a speed table; got = the speed it really gives.
-// Points that don't move, or aren't faster than the previous one, are skipped. Slower than the slowest usable
-// point: run at that point (the hysteresis decides when to stop). Faster than the fastest: capped.
-static float offsetFor(float want, const float *dps, float &got) {
-  float pu = 0, pv = 0;
-  bool have = false;
-  for (int i = 0; i < GIMBAL_CAL_N; i++) {
-    float u = GIMBAL_CAL_US[i], v = dps[i];
-    if (v <= (have ? pv : 0)) continue;
-    if (want <= v) {
-      if (!have) {
-        got = v;
-        return u;
-      }
-      got = want;
-      return pu + (want - pv) / (v - pv) * (u - pu);
-    }
-    pu = u;
-    pv = v;
-    have = true;
-  }
-  got = pv;
-  return have ? pu : 0;
-}
-
-// Wanted speed (deg/s, + = FORWARD) -> pulse (us, 0 = none); eff = the speed that pulse gives
-static float pulseFor(float rate, float neutral, float sign, const float *fwd, const float *rev, float &eff) {
-  eff = 0;
-  if (rate == 0) return 0;
-  float got, off = offsetFor(fabsf(rate), rate > 0 ? fwd : rev, got);
-  if (off <= 0) return 0;
-  eff = rate > 0 ? got : -got;
-  return neutral + (rate > 0 ? sign : -sign) * off;
-}
-
-static void writePulse(int ch, float us) {
-#ifndef GIMBAL_SIM  // the simulation never drives the real servos
-  ledcWrite(ch, us > 0 ? (uint32_t)(us / SERVO_PERIOD_US * ((1 << SERVO_BITS) - 1)) : 0);
-#endif
-}
-
-// Tracking, from the source's angle relative to the plate (tracked direction u, array frame): its angle along U
-// is the elevation error; its angle along L, divided by cos(elevation), the pan error (pan moves the axis cos(el)
-// deg per deg). The estimated pose is only used for that scaling and the limits, so its drift doesn't bend the aim.
-// Start when the total pointing error exceeds GIMBAL_START_DEG, stop once it's under GIMBAL_STOP_DEG.
-static void aim(const float u[3], float &wantP, float &wantT) {
-  float aT = atan2f(u[0] * axU[0] + u[1] * axU[1], u[2]) * R2D;
-  float aL = atan2f(u[0] * axL[0] + u[1] * axL[1], u[2]) * R2D;
-  float ce = std::max(cosf(gb.el * D2R), 0.3f);  // caps the pan gain near the zenith (x 3.3)
-  float tp = clampf(gb.pan + aL / ce, P_LO, P_HI), tt = clampf(gb.el + aT, T_LO, T_HI);
-  gb.limits = (gb.pan + aL / ce < P_LO ? 1 : 0) | (gb.pan + aL / ce > P_HI ? 2 : 0) | (gb.el + aT < T_LO ? 4 : 0) |
-              (gb.el + aT > T_HI ? 8 : 0);
-  float dp = tp - gb.pan, dt = tt - gb.el, ep = dp * ce;
-  gb.tgtP = tp; gb.tgtT = tt; gb.errP = ep; gb.errT = dt;
-  float err = sqrtf(ep * ep + dt * dt);  // total pointing error (both axes)
-  if (!gb.moving && err > GIMBAL_START_DEG) gb.moving = true;
-  if (gb.moving && err < GIMBAL_STOP_DEG) gb.moving = false;
-  gb.movP = gb.moving && fabsf(ep) > 1;  // an axis with almost no error stays put (its slowest speed would overshoot)
-  gb.movT = gb.moving && fabsf(dt) > 1;
-  wantP = gb.movP ? clampf(GIMBAL_GAIN * dp, -GIMBAL_MAX_DPS, GIMBAL_MAX_DPS) : 0;
-  wantT = gb.movT ? clampf(GIMBAL_GAIN * dt, -GIMBAL_MAX_DPS, GIMBAL_MAX_DPS) : 0;
-}
-
-// Search moves: to a pose within 1 deg, at up to GIMBAL_SEARCH_DPS. True once there and stopped.
-static bool goTo(float tp, float tt, float &wantP, float &wantT) {
-  float dp = tp - gb.pan, dt = tt - gb.el;
-  gb.tgtP = tp; gb.tgtT = tt; gb.errP = dp; gb.errT = dt; gb.limits = 0;
-  wantP = fabsf(dp) > 1 ? clampf(GIMBAL_GAIN * dp, -GIMBAL_SEARCH_DPS, GIMBAL_SEARCH_DPS) : 0;
-  wantT = fabsf(dt) > 1 ? clampf(GIMBAL_GAIN * dt, -GIMBAL_SEARCH_DPS, GIMBAL_SEARCH_DPS) : 0;
-  return wantP == 0 && wantT == 0 && gb.rp == 0 && gb.rt == 0;
-}
-
-// Listening stops at pan -GIMBAL_SEARCH_PAN_DEG, 0, +GIMBAL_SEARCH_PAN_DEG: the array hears its whole front
-// hemisphere, so these cover the travel without sweeping it end to end (every degree travelled adds drift)
-static int nStops() { return 3; }
-static float stopPan(int i) { return clampf((i - 1) * GIMBAL_SEARCH_PAN_DEG, P_LO, P_HI); }
-
-static void startSearch() {
-  int n = nStops(), best = 0;
-  float from = clampf(gb.srcAz, P_LO, P_HI);  // start at the stop nearest where the source was last seen...
-  for (int i = 1; i < n; i++)
-    if (fabsf(stopPan(i) - from) < fabsf(stopPan(best) - from)) best = i;
-  gb.wp = best;
-  gb.wpDir = best < (n - 1) / 2.0f ? 1 : -1;  // ...then head for the far end
-  gb.passes = 0;
-  gb.dwell = 0;
-  gb.state = 3;
-}
-
-static void searchStep(float dt, float &wantP, float &wantT) {
-  float el = clampf(GIMBAL_SEARCH_EL_DEG, T_LO, T_HI);
-  if (gb.state == 4) {  // parked at the centre, listening
-    goTo(clampf(0, P_LO, P_HI), el, wantP, wantT);
-    return;
-  }
-  if (!goTo(stopPan(gb.wp), el, wantP, wantT)) return;
-  if ((gb.dwell += dt) < GIMBAL_SEARCH_DWELL_S) return;  // listen with the servos stopped
-  gb.dwell = 0;
-  if (gb.wp + gb.wpDir < 0 || gb.wp + gb.wpDir >= nStops()) {  // reached an end stop: one pass done
-    gb.wpDir = -gb.wpDir;
-    if (++gb.passes >= GIMBAL_SEARCH_PASSES) {
-      gb.state = 4;
-      return;
-    }
-  }
-  gb.wp += gb.wpDir;
-}
-
-static void autoStep(float dt, float &wantP, float &wantT) {
-  bool have = trk.state == 1 || (trk.state == 2 && trk.since < GIMBAL_COAST_STOP_S);
-  if (have) {
-    float s[3];  // for the display and where to start a search
-    toWorld(trk.o, gb.pan, gb.el, s);
-    gb.srcAz = atan2f(s[1], s[0]) * R2D;
-    gb.srcEl = asinf(clampf(s[2], -1, 1)) * R2D;
-    gb.state = 1;
-    gb.lostFor = 0;
-    aim(trk.o, wantP, wantT);
-    return;
-  }
-  gb.moving = gb.movP = gb.movT = false;
-  if (trk.state == 0) gb.lostFor += dt;
-  if (gb.state == 3 || gb.state == 4) {
-    searchStep(dt, wantP, wantT);
-  } else if (GIMBAL_SEARCH_ENABLE && trk.state == 0 && gb.lostFor >= GIMBAL_SEARCH_DELAY_S) {
-    startSearch();
-    searchStep(dt, wantP, wantT);
-  } else {
-    gb.state = 2;  // holding: stopped, waiting for the tone
-  }
-}
-
-static void gimbalStep(TdoaPacket &pkt, GimbalPacket &g) {
-  const float dt = TRK_DT;
-  uint32_t now = millis();
-  if (gb.mode == 2 && now - gb.cmdAt > gb.jogMs) gb.mode = 0;
-  if (gb.mode == 3 && now - gb.cmdAt > gb.rawMs) gb.mode = 0;
-  float wantP = 0, wantT = 0;
-  if (gb.mode == 1) {
-    autoStep(dt, wantP, wantT);
-  } else {
-    gb.state = 0;
-    gb.moving = gb.movP = gb.movT = false;
-    gb.lostFor = 0;
-    gb.tgtP = gb.pan; gb.tgtT = gb.el; gb.errP = gb.errT = 0; gb.limits = 0;
-    if (gb.mode == 2) {  // jog: no limits (manual, and the estimate may be wrong, e.g. while calibrating)
-      wantP = gb.jogP;
-      wantT = gb.jogT;
-    }
-  }
-  if (gb.mode == 1) {
-    const float dmax = GIMBAL_ACCEL_DPS2 * dt;
-    gb.rp += clampf(wantP - gb.rp, -dmax, dmax);
-    gb.rt += clampf(wantT - gb.rt, -dmax, dmax);
-  } else if (gb.mode == 2) {  // jog: straight to the asked speed, as a manual control should
-    gb.rp = wantP;
-    gb.rt = wantT;
-  } else {
-    gb.rp = gb.rt = 0;
-  }
-  if (gb.mode == 1) {  // automatic: never further past a limit
-    if ((gb.rp > 0 && gb.pan >= P_HI) || (gb.rp < 0 && gb.pan <= P_LO)) gb.rp = 0;
-    if ((gb.rt > 0 && gb.el >= T_HI) || (gb.rt < 0 && gb.el <= T_LO)) gb.rt = 0;
-  }
-  float effP = 0, effT = 0;
-  if (gb.mode == 3) {  // calibration: raw pulse offsets, not counted in the pose
-    gb.usP = gb.rawP != 0 ? GIMBAL_PAN_NEUTRAL_US + GIMBAL_PAN_FWD_SIGN * gb.rawP : 0;
-    gb.usT = gb.rawT != 0 ? GIMBAL_TILT_NEUTRAL_US + GIMBAL_TILT_FWD_SIGN * gb.rawT : 0;
-  } else {
-    gb.usP = pulseFor(gb.rp, GIMBAL_PAN_NEUTRAL_US, GIMBAL_PAN_FWD_SIGN, GIMBAL_PAN_FWD_DPS, GIMBAL_PAN_REV_DPS, effP);
-    gb.usT = pulseFor(gb.rt, GIMBAL_TILT_NEUTRAL_US, GIMBAL_TILT_FWD_SIGN, GIMBAL_TILT_FWD_DPS, GIMBAL_TILT_REV_DPS, effT);
-  }
-  writePulse(0, gb.usP);
-  writePulse(1, gb.usT);
-
-  // Dead reckoning. The tracker's directions (array frame) turn with the plate.
-  float p0 = gb.pan, e0 = gb.el;
-  gb.pan += effP * dt;
-  gb.motT += effT * dt;  // elevation: the plate only moves once the motor has crossed the worm gear's slack
-  if (gb.motT > gb.el) gb.el = gb.motT;
-  else if (gb.motT < gb.el - GIMBAL_TILT_BACKLASH_DEG) gb.el = gb.motT + GIMBAL_TILT_BACKLASH_DEG;
-  if (gb.pan != p0 || gb.el != e0) {
-    reframe(trk.e, p0, e0, gb.pan, gb.el);
-    reframe(trk.o, p0, e0, gb.pan, gb.el);
-    reframe(trk.cmd, p0, e0, gb.pan, gb.el);
-    reframe(trk.cmdS, p0, e0, gb.pan, gb.el);
-    reframe(centre, p0, e0, gb.pan, gb.el);
-  }
-  gb.ep = effP;
-  gb.et = effT;
-
-  g.mode = gb.mode; g.state = gb.state; g.pan = gb.pan; g.tilt = gb.el;
-  g.panRate = effP; g.tiltRate = effT; g.panUs = gb.usP; g.tiltUs = gb.usT;
-  g.tgtPan = gb.tgtP; g.tgtTilt = gb.tgtT; g.errPan = gb.errP; g.errTilt = gb.errT;
-  g.srcAz = gb.srcAz; g.srcEl = gb.srcEl; g.limits = gb.limits; g.calibrated = GIMBAL_CALIBRATED;
-  g.searchPass = gb.passes; g.txDrops = gb.txDrops; g.tiltSlack = GIMBAL_TILT_BACKLASH_DEG - (gb.el - gb.motT);
-  pkt.panRate = effP * D2R; pkt.tiltRate = effT * D2R; pkt.panUs = gb.usP; pkt.tiltUs = gb.usT;
-  pkt.moving = gb.movP || gb.movT; pkt.servoMode = gb.mode;
-}
-
-// LED: off = off, green = tracking (red = tracking but the source is outside the travel), yellow = holding,
-// blue = searching, purple = parked, white = jog / calibration
-static void showState() {
-  static int last = -1;
-  int code = gb.mode == 0 ? 0 : gb.mode >= 2 ? 5 : gb.state == 1 ? (gb.limits ? 6 : 1) : gb.state;
-  if (code == last) return;
-  last = code;
-  static const uint8_t RGB[7][3] = {{0, 0, 0}, {0, 40, 0}, {30, 30, 0}, {0, 0, 40}, {20, 0, 20}, {20, 20, 20}, {40, 0, 0}};
-  neopixelWrite(21, RGB[code][1], RGB[code][0], RGB[code][2]);  // this board's LED has red and green swapped
-}
-
-// ---------------------------------------------------------------- closed-loop simulation (gimbal_sim)
-#ifdef GIMBAL_SIM
-// A scripted source in the world (scenario) is heard by a simulated array sitting on the gimbal at its TRUE pose.
-// The true pose integrates the speeds the board commands with per-direction speed errors (SIM_ERR_*: an assumed
-// residual error of the calibrated tables, not a measured one), so the dead-reckoned pose drifts from it. The plate blocks sound from behind.
-// The elevation has SIM_TILT_BACKLASH of worm-gear slack. Servo dynamics (spin-up, coasting) are not modelled. "R" restarts the scenario with both poses at home.
-static const float SIM_ERR_PF = 0.05f, SIM_ERR_PR = -0.03f, SIM_ERR_TF = -0.05f, SIM_ERR_TR = 0.05f;
-static const float SIM_TILT_BACKLASH = 6.0f;  // true worm-gear slack in the sim (deg), assumed
-static const float SCEN_S = 70;
-static float simT = 0, simPan = 0, simTilt = 0, simMotT = 0, simSrcAz = 0, simSrcEl = 0, simAz = 0, simEl = 0;
-static bool simTone = false;
-
 static void scenario(float t, float &az, float &el, bool &on) {
   on = true;
   if (t < 10) { az = 40; el = 25; }                                      // still: acquire and settle
   else if (t < 20) { az = 40 - 9 * (t - 10); el = 25 + 2 * (t - 10); }   // moving 9 deg/s in az, 2 in el
-  else if (t < 26) { az = -50; el = 45; on = false; }                    // tone off: hold, then search
+  else if (t < 26) { az = -50; el = 45; on = false; }                    // tone off: hold
   else if (t < 36) { az = -70; el = 15; }                                // back on elsewhere
-  else if (t < 46) { az = 150; el = 30; }                                // behind: outside the pan range
+  else if (t < 46) { az = -125; el = 10; }                               // past the pan stop, still audible
   else if (t < 56) { az = -20; el = 82; }                                // near the zenith
-  else if (t < 66) { az = 10; el = 2; }                                  // near the horizon (below the margin)
+  else if (t < 66) { az = 10; el = 2; }                                  // near the horizon
   else { az = 10; el = 2; on = false; }
 }
 
 static void simulate() {
   static float ph = 0;
   static uint32_t lcg = 12345;
-  const float dt = (float)HOP / RATE;
-  simT += dt;
+  simT += (float)HOP / RATE;
   if (simT >= SCEN_S) simT -= SCEN_S;
   scenario(simT, simSrcAz, simSrcEl, simTone);
-  simPan += gb.ep * (1 + (gb.ep > 0 ? SIM_ERR_PF : SIM_ERR_PR)) * dt;
-  simMotT += gb.et * (1 + (gb.et > 0 ? SIM_ERR_TF : SIM_ERR_TR)) * dt;
-  if (simMotT > simTilt) simTilt = simMotT;
-  else if (simMotT < simTilt - SIM_TILT_BACKLASH) simTilt = simMotT + SIM_TILT_BACKLASH;
   float a = simSrcAz * D2R, e = simSrcEl * D2R;
   float s[3] = {cosf(e) * cosf(a), cosf(e) * sinf(a), sinf(e)}, u[3];
   toArray(s, simPan, simTilt, u);
   simAz = fmodf(atan2f(u[1], u[0]) * R2D + 360, 360);
   simEl = asinf(clampf(u[2], -1, 1)) * R2D;
-  float gain = simTone && u[2] > -0.1f ? 1 : 0;
+  float gain = simTone && u[2] > -0.1f ? 1 : 0;  // the plate blocks sound from behind
   float off[4];
   for (int m = 0; m < 4; m++)  // geometric phase, minus each mic's configured extra delay (as real mics would have)
     off[m] = OMEGA * (MIC_POS[m][0] * u[0] + MIC_POS[m][1] * u[1] + MIC_POS[m][2] * u[2]) / TDOA_SPEED - OMEGA * 1e-6f * MIC_DELAY_US[m];
@@ -875,58 +776,29 @@ static void simulate() {
 
 // ---------------------------------------------------------------- host commands
 // One per line:
-//   E1 automatic (refused until GIMBAL_CALIBRATED), E0 or S off (no pulses)
-//   H  pose = home (put the gimbal there by hand first: pan centred, plate facing the horizon)
-//   JP<deg/s> / JT<deg/s>  jog one axis (+ = FORWARD), counted in the pose, no limits; stops 0.3 s after the
-//                          last one, so repeat to keep moving
-//   NP<deg/s> <ms> / NT..  as J, for exactly that long (board-timed step; calibration fine adjustment)
-//   CP<us> / CT<us>  raw pulse offset from neutral (+ = FORWARD, 0 = stop) for calibration: not counted in the
-//                    pose, no limits, 10 s at most
-//   MP<us> / MT<us>  as C, but stops 0.3 s after the last one (repeat while held; currently unused)
-//   R  (gimbal_sim only) restart the scenario, both poses at home
-static void setHome() {  // home is zeroed with the elevation slack taken up for moving up
-  gb.pan = gb.el = gb.motT = 0;
-  for (int i = 0; i < HIST; i++) hist[i][0] = hist[i][1] = 0;
-}
-
+//   E1 automatic, E0 or S off (no pulses)
+//   JP<us> / JT<us>  jog one axis at that pulse offset from neutral (+ = FORWARD); stops 0.3 s after the last one,
+//                    so repeat to keep moving. Clears the hard-stop blocks.
+//   R  (gimbal_sim only) restart the scenario with the gimbal at home
 static void handleCommand(const char *c) {
   switch (c[0]) {
     case 'E':
-      if (c[1] != '1') gb.mode = 0;
-      else if (CAN_AUTO) {
-        gb.mode = 1;
-        gb.state = 2;
-        gb.lostFor = 0;
-      }
+      gb.mode = c[1] == '1' ? 1 : 0;
+      gb.blocked[0] = gb.blocked[1] = 0;
       break;
     case 'S': gb.mode = 0; break;
-    case 'H': setHome(); break;
     case 'J':
-    case 'N': {
       if (c[1] != 'P' && c[1] != 'T') break;
-      char *end;
-      float v = strtof(c + 2, &end);
-      gb.jogP = c[1] == 'P' ? v : 0;
-      gb.jogT = c[1] == 'T' ? v : 0;
-      gb.jogMs = c[0] == 'N' ? (uint32_t)clampf(strtof(end, nullptr), 1, 5000) : JOG_TIMEOUT_MS;
+      gb.jog[0] = c[1] == 'P' ? clampf(atof(c + 2), -800, 800) : 0;
+      gb.jog[1] = c[1] == 'T' ? clampf(atof(c + 2), -800, 800) : 0;
+      gb.blocked[0] = gb.blocked[1] = 0;
       gb.mode = 2;
-      gb.cmdAt = millis();
-      break;
-    }
-    case 'C':
-    case 'M':
-      if (c[1] != 'P' && c[1] != 'T') break;
-      gb.rawP = c[1] == 'P' ? clampf(atof(c + 2), -800, 800) : 0;
-      gb.rawT = c[1] == 'T' ? clampf(atof(c + 2), -800, 800) : 0;
-      gb.mode = gb.rawP != 0 || gb.rawT != 0 ? 3 : 0;
-      gb.rawMs = c[0] == 'M' ? JOG_TIMEOUT_MS : RAW_MAX_MS;
-      gb.cmdAt = millis();
+      gb.jogAt = millis();
       break;
 #ifdef GIMBAL_SIM
     case 'R':
       simT = 0;
-      simPan = simTilt = simMotT = 0;
-      setHome();
+      simPan = simTilt = simMotT = simPush = 0;
       break;
 #endif
   }
@@ -958,14 +830,13 @@ void setup() {
   buildGrid();
   initAxes();
   startCapture();
-  ledcSetup(0, 50, SERVO_BITS);
-  ledcSetup(1, 50, SERVO_BITS);
+  for (int a = 0; a < 2; a++) {
+    ledcSetup(a, 50, SERVO_BITS);
 #ifndef GIMBAL_SIM
-  ledcAttachPin(GIMBAL_PAN_PIN, 0);
-  ledcAttachPin(GIMBAL_TILT_PIN, 1);
+    ledcAttachPin(PIN[a], a);
 #endif
-  writePulse(0, 0);  // no pulses until told
-  writePulse(1, 0);
+    writePulse(a, 0);  // no pulses until told
+  }
   neopixelWrite(21, 0, 0, 0);
 }
 
@@ -982,8 +853,6 @@ void loop() {
   TdoaPacket pkt = {{'T', 'D', 'O', 'A'}};
   GimbalPacket g = {{'G', 'M', 'B', 'L'}};
   pktCount++;
-  hist[pktCount % HIST][0] = gb.pan;  // pose while this packet's audio arrived
-  hist[pktCount % HIST][1] = gb.el;
   if (pktCount - lastFix > (uint32_t)(TDOA_TRACK_HOLD_S * RATE / HOP)) {  // lost it: search around the axis again
     centre[0] = 0; centre[1] = 0; centre[2] = 1;
   }
@@ -1006,12 +875,13 @@ void loop() {
   }
   {
     float u[3] = {pkt.ux, pkt.uy, pkt.uz};
-    bool have = pkt.freq > 0;
-    if (have && GIMBAL_EST_LAG_PKTS > 0 && pktCount > GIMBAL_EST_LAG_PKTS) {  // the estimate describes the pose
-      const float *h = hist[(pktCount - GIMBAL_EST_LAG_PKTS) % HIST];         // GIMBAL_EST_LAG_PKTS ago
-      reframe(u, h[0], h[1], gb.pan, gb.el);
+    if (gb.quietS >= GIMBAL_QUIET_GAP_S) {
+      trackStep(pkt.freq > 0, u, pkt.quality, pkt);
+    } else {  // servos noisy: tracker frozen (holds its direction, no lost count); averaging restarts afterwards
+      gValid = false;
+      pkt.trackState = trk.state;
+      for (int c = 0; c < 3; c++) pkt.tu[c] = trk.state ? trk.o[c] : 0;
     }
-    trackStep(have, u, pkt.quality, pkt);
   }
   readCommands();
   gimbalStep(pkt, g);
@@ -1021,7 +891,7 @@ void loop() {
   pkt.simAz = simAz;
   pkt.simEl = simEl;
   g.simT = simT; g.simPan = simPan; g.simTilt = simTilt;
-  g.simSrcAz = simSrcAz; g.simSrcEl = simSrcEl; g.simTone = simTone;
+  g.simSrcAz = simSrcAz; g.simSrcEl = simSrcEl; g.simTone = simTone; g.simPush = simPush;
 #endif
 
   // Never block: with nobody reading the port, a full buffer drops the packet instead

@@ -1,6 +1,6 @@
 """Serial reader for the gimbal firmware (tdoa/src/gimbal.cpp; keep in sync with its GimbalPacket).
 
-Packet, 125 per second: "SYNC" + bus A + bus B (int16) + "TDOA" + 32 float32 (as tstream.py) + "GMBL" + 25 float32,
+Packet, 125 per second: "SYNC" + bus A + bus B (int16) + "TDOA" + 32 float32 (as tstream.py) + "GMBL" + 18 float32,
 all little-endian.
 """
 import struct
@@ -11,31 +11,23 @@ import serial
 from tstream import Result, find_port, HOP, BLK16, NF, PKT as TDOA_PKT, FULL_SCALE
 from tconfig import MIC_SLOT
 
-GNF = 25
+GNF = 18
 PKT = TDOA_PKT + 4 + 4 * GNF
-MODES = ["off", "auto", "jog", "calibration"]
-STATES = ["idle", "tracking", "holding", "searching", "parked"]
+MODES = ["off", "auto", "jog"]
+STATES = ["idle", "tracking", "holding"]
 
 
 @dataclass
 class Gimbal:
-    mode: int            # 0 off (no pulses), 1 automatic, 2 jog, 3 raw pulses (calibration)
-    state: int           # 0 idle, 1 tracking, 2 holding, 3 searching, 4 parked
-    pan: float           # estimated pose, deg (dead reckoning). + pan = FORWARD (towards mic 4)
-    tilt: float          # deg, 0 = facing the horizon, 90 = facing up
-    pan_rate: float      # deg/s the pulses give, + = FORWARD
-    tilt_rate: float
+    mode: int            # 0 off (no pulses), 1 automatic, 2 jog
+    state: int           # 0 idle, 1 tracking, 2 holding (no usable direction: stopped)
+    err_pan: float       # pointing error from the mics, deg: + = pan needs to go FORWARD (towards mic 4)
+    err_tilt: float      # + = elevation needs to go UP (towards mic 2)
+    err: float           # total, deg
+    moving: bool         # outside the deadband, driving
     pan_us: float        # pulses sent (0 = none)
     tilt_us: float
-    tgt_pan: float       # pose being driven to
-    tgt_tilt: float
-    err_pan: float       # pointing error per axis, deg (pan part scaled by cos elevation)
-    err_tilt: float
-    src_az: float        # source direction in the world, deg, from the track and the estimated pose
-    src_el: float
-    limits: int          # target clipped: 1 pan min, 2 pan max, 4 tilt min, 8 tilt max
-    calibrated: bool
-    search_pass: int
+    blocked: int         # directions blocked by a hard stop: 1 pan FORWARD, 2 pan REVERSE, 4 elev UP, 8 elev DOWN
     tx_drops: int        # packets the board dropped because nobody was reading
     sim_t: float         # gimbal_sim truth, else 0
     sim_pan: float
@@ -43,7 +35,8 @@ class Gimbal:
     sim_src_az: float
     sim_src_el: float
     sim_tone: bool
-    tilt_slack: float    # elevation slack left before the plate moves down (0 = engaged downwards)
+    sim_push: float      # s the sim spent driving an axis into a hard stop
+    listening: bool      # servos quiet: mic estimates used (else the tracker is frozen)
 
 
 def _result(v):
@@ -52,8 +45,8 @@ def _result(v):
 
 
 def _gimbal(v):
-    return Gimbal(int(v[0]), int(v[1]), *v[2:14], int(v[14]), bool(v[15]), int(v[16]), int(v[17]),
-                  *v[18:23], bool(v[23]), v[24])
+    return Gimbal(int(v[0]), int(v[1]), v[2], v[3], v[4], bool(v[5]), v[6], v[7], int(v[8]), int(v[9]),
+                  v[10], v[11], v[12], v[13], v[14], bool(v[15]), v[16], bool(v[17]))
 
 
 class GimbalStream:
@@ -73,7 +66,7 @@ class GimbalStream:
         threading.Thread(target=self._run, daemon=True).start()
 
     def send(self, command):
-        """E1 auto, E0/S off, H home, JP<dps>/JT<dps> jog, CP<us>/CT<us> raw pulse offset, R restart (sim)."""
+        """E1 auto, E0/S off, JP<us>/JT<us> jog at a pulse offset (repeat every 0.1 s), R restart (sim)."""
         self.ser.write((command + "\n").encode())
 
     def close(self):

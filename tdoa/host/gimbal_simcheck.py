@@ -4,9 +4,8 @@
 
 Restarts the board's 70 s scenario (scenario() in src/gimbal.cpp), switches to automatic and records one run.
 Per phase it reports the true pointing error (true plate axis vs true source) in the phase's last 4 s, how much
-of that is unavoidable (source outside the travel), time to (re)acquire, servo reversals (oscillation), and
-overall whether the true pose stayed inside the travel and how far the dead-reckoned pose drifted from it.
-The board's sim gives the servos speed errors (+8 % / -5 % pan, -10 % / +10 % elevation), so drift is expected.
+of that is unavoidable (source outside the hard stops), time to (re)acquire, and servo reversals (oscillation).
+Overall: time spent driving into a hard stop, and how often an axis got blocked as being against one.
 """
 import argparse
 import time
@@ -19,11 +18,12 @@ PHASES = [  # (start s, end s, label, tone on) as in scenario()
     (10, 20, "moving az 40->-50, el 25->45", True),
     (20, 26, "tone off", False),
     (26, 36, "on again at az -70 el 15", True),
-    (36, 46, "behind: az 150 el 30", True),
+    (36, 46, "past the pan stop: az -125 el 10", True),
     (46, 56, "near zenith: az -20 el 82", True),
     (56, 66, "near horizon: az 10 el 2", True),
     (66, 70, "tone off", False),
 ]
+PAN_STOPS, TILT_STOPS = (-90, 90), (0, 90)   # the sim's hard stops
 
 
 def unit(az, el):
@@ -36,15 +36,10 @@ def ang(u, v):
 
 
 def best_pose(az, el):
-    """Closest reachable pose (inside the travel margin) to each source direction, by brute force."""
-    pans = np.arange(G.P_LO, G.P_HI + 0.01, 0.5)
-    tilts = np.arange(G.T_LO, G.T_HI + 0.01, 0.5)
-    P, T = np.meshgrid(pans, tilts)
+    """Smallest possible pointing error for each source direction, poses limited by the hard stops."""
+    P, T = np.meshgrid(np.arange(PAN_STOPS[0], PAN_STOPS[1] + 0.01, 0.5), np.arange(TILT_STOPS[0], TILT_STOPS[1] + 0.01, 0.5))
     grid = unit(P.ravel(), T.ravel())
-    out = []
-    for s in unit(az, el):
-        out.append(np.max(grid @ s))
-    return np.degrees(np.arccos(np.clip(out, -1, 1)))
+    return np.degrees(np.arccos(np.clip([np.max(grid @ s) for s in unit(az, el)], -1, 1)))
 
 
 def main():
@@ -58,6 +53,7 @@ def main():
         raise SystemExit("No gimbal packets. Flash it: pio run -d tdoa -e gimbal_sim -t upload")
     if rows[-1][1].sim_t == 0 and rows[-2][1].sim_t == 0:
         raise SystemExit("This is the real gimbal firmware, not gimbal_sim")
+    st.send("E0")
     st.send("R")
     st.send("E1")
     time.sleep(0.2)
@@ -74,27 +70,26 @@ def main():
     g = [x[1] for x in data]
     r = [x[0] for x in data]
     t = np.array([x.sim_t for x in g])
-    keep = np.r_[True, np.diff(t) > 0]          # stop at the wrap
+    keep = np.r_[True, np.diff(t) > 0]
     cut = np.argmin(keep) if not keep.all() else len(t)
     g, r, t = g[:cut], r[:cut], t[:cut]
-    n = len(t)
-    print(f"{n} packets over {t[-1] - t[0]:.1f} s ({n / max(t[-1] - t[0], 1e-9):.1f}/s)")
+    print(f"{len(t)} packets over {t[-1] - t[0]:.1f} s")
 
     def col(name):
         return np.array([getattr(x, name) for x in g], float)
 
-    pan, tilt, span, stilt = col("pan"), col("tilt"), col("sim_pan"), col("sim_tilt")
-    saz, sel, tone = col("sim_src_az"), col("sim_src_el"), col("sim_tone")
-    state, prate, trate = col("state"), col("pan_rate"), col("tilt_rate")
-    axis, src = unit(span, stilt), unit(saz, sel)
-    err = ang(axis, src)
+    span, stilt = col("sim_pan"), col("sim_tilt")
+    saz, sel = col("sim_src_az"), col("sim_src_el")
+    state, pus, tus, blocked = col("state"), col("pan_us"), col("tilt_us"), col("blocked")
+    err = ang(unit(span, stilt), unit(saz, sel))
     floor = best_pose(saz, sel)
-    trk = np.array([x.track_state for x in r])
+    pdir = np.where(pus > 0, np.sign((pus - G.PAN_NEUTRAL) * G.PAN_FWD_SIGN), 0)
+    tdir = np.where(tus > 0, np.sign((tus - G.TILT_NEUTRAL) * G.TILT_FWD_SIGN), 0)
     if args.save:
-        np.savez(args.save, t=t, pan=pan, tilt=tilt, sim_pan=span, sim_tilt=stilt, src_az=saz, src_el=sel,
-                 tone=tone, state=state, pan_rate=prate, tilt_rate=trate, err=err, floor=floor, track=trk)
+        np.savez(args.save, t=t, sim_pan=span, sim_tilt=stilt, src_az=saz, src_el=sel, state=state, pan_us=pus,
+                 tilt_us=tus, blocked=blocked, err=err, floor=floor, err_pan=col("err_pan"), err_tilt=col("err_tilt"))
 
-    names = ["idle", "tracking", "holding", "searching", "parked"]
+    names = ["idle", "tracking", "holding"]
     print(f"\n{'phase':34s} {'acquire':>8s} {'err med/p95/max':>17s} {'unavoid':>8s} {'rev P/T':>8s}  states")
     for a, b, label, on in PHASES:
         m = (t >= a) & (t < b)
@@ -110,21 +105,18 @@ def main():
         else:
             errs, unav = "                -", "       -"
         rev = []
-        for rate in (prate, trate):
-            sg = np.sign(rate[s])
-            sg = sg[sg != 0]
+        for d in (pdir, tdir):
+            sg = d[s][d[s] != 0]
             rev.append(int(np.sum(sg[1:] != sg[:-1])))
-        frac = {names[k]: np.mean(state[m] == k) for k in range(5) if np.mean(state[m] == k) > 0.005}
-        fs = " ".join(f"{k} {v:.0%}" for k, v in frac.items())
+        fs = " ".join(f"{names[k]} {np.mean(state[m] == k):.0%}" for k in range(3) if np.mean(state[m] == k) > 0.005)
         print(f"{label:34s} {acq:>8s} {errs:>17s} {unav:>8s} {rev[0]:>3d}/{rev[1]:<3d}  {fs}")
 
     print("\nerr = true angle between plate axis and source in the phase's last 4 s (deg); unavoid = median of the")
-    print("best reachable error there (source outside the travel); rev = servo direction reversals in that window.")
-    print(f"\nTrue pose range: pan {span.min():.1f} .. {span.max():.1f} (allowed {G.PAN_MIN:.0f} .. {G.PAN_MAX:.0f}), "
-          f"elevation {stilt.min():.1f} .. {stilt.max():.1f} (allowed {G.TILT_MIN:.0f} .. {G.TILT_MAX:.0f})")
-    print(f"Dead-reckoning drift at the end (estimate - true): pan {pan[-1] - span[-1]:+.1f}, "
-          f"elevation {tilt[-1] - stilt[-1]:+.1f} deg; largest |pan| {np.max(np.abs(pan - span)):.1f}, "
-          f"|elevation| {np.max(np.abs(tilt - stilt)):.1f}")
+    print("best reachable error there (source past the hard stops); rev = servo direction reversals in that window.")
+    print(f"\nTrue pose range: pan {span.min():.1f} .. {span.max():.1f}, elevation {stilt.min():.1f} .. {stilt.max():.1f}")
+    print(f"Driving into a hard stop: {g[-1].sim_push:.1f} s in total")
+    starts = np.flatnonzero((blocked[1:] > 0) & (blocked[:-1] == 0))
+    print(f"Blocked as 'against a stop': {len(starts)} time(s)" + (" at t = " + ", ".join(f"{t[i + 1]:.1f}" for i in starts) if len(starts) else ""))
     print(f"Packets dropped by the board (nobody reading): {g[-1].tx_drops}")
 
 

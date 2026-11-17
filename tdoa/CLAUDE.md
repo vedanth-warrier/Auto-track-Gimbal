@@ -89,6 +89,8 @@ See `README.md` for layout, commands and measured results. The parent `CLAUDE.md
   The elevation speed tables measured before 2026-11-12 crossed the slack on every run (cal alternates
   directions), so they read low: redo with `gimbal_cal.py --axis tilt` (now takes up the slack first).
 - Deadband: START 20 / STOP 20 deg on the total pointing error (user 2026-11-12; earlier 10 / 4, 4 / 2).
+- Dead reckoning counts LEDC frames (timer 0 overflows), not packets: before, every short move could be off by up
+  to a whole 20 ms frame (~1.2 deg elevation, ~2.5 pan at 300 us). N command = exact number of frames.
 - Calibration is easy-angle only (user has no protractor): gimbal_cal.py, elevation 0 <-> 90, pan -90 <-> +90;
   first move board-timed (NP/NT command), user fine-adjusts; least squares 90 = k*counted - slack*crossed.
   gimbal_backlash.py and gimbal_travel.py were removed (needed arbitrary angle readings).
@@ -99,8 +101,14 @@ See `README.md` for layout, commands and measured results. The parent `CLAUDE.md
   likely; GUI resend gaps possible: gimbal_view now counts jog drop-outs). gimbal_travel.py (removed) measured CAL_US[0]
   speeds over the full travel with counted moves. Jog has no limits (user: needed for calibration).
 
+- 2026-11-15: position estimation removed entirely (user fitted hard stops, no switches): steering from the mic
+  error only; dead reckoning, speed tables, slack model, frame counting, gimbal_cal.py all gone (old version in git
+  history / README "Measured"). Look-move-look bursts (MOVE_S / SETTLE_S) because the estimate lags 0.15-0.2 s and
+  the servos are 60-270 deg/s. Hard stops detected from no error reduction over a burst (steady start only),
+  blocked direction retried every BLOCK_RETRY_S.
+
 ## Open
-- Gimbal: gimbal_cal.py --write (easy angles), reflash, then a real-tone test with gimbal_view.py. Not run on hardware yet. Then hard stops + re-homing against them.
+- Gimbal: real-tone test with gimbal_view.py (AUTO); tune gimbal_config.h from what it does. Not run on hardware yet. Then hard stops + re-homing against them.
 - jumps.py recordings: (a) source still on a stand at 3-4 known positions (ground truth), (b) slow movement within
   ~25 deg of the axis (gimbal regime).
 - servotest.py --write on the gimbal, reflash, then E1 (auto) with a tone.

@@ -38,28 +38,27 @@ Uses the existing wiring unchanged. Nothing outside this folder is used or modif
 
 ## Gimbal (`src/gimbal.cpp`, settings `src/gimbal_config.h`)
 Separate firmware: `main.cpp`'s pipeline up to the tracker (copied unchanged) driving the FS90MR servos, pan on
-GPIO10 (about the vertical, ±90 from centre) and elevation on GPIO11 (0 = plate facing the horizon, 90 = up).
-- **Directions.** Pan FORWARD (pulse above neutral) swings the axis towards mic 4, elevation FORWARD towards mic 2
-  (`GIMBAL_PANFWD_AZ_DEG`, `GIMBAL_UP_AZ_DEG`). Home (boot, or `H`) = pan centred, plate facing the horizon.
-- **Aim.** From the source's angle off the plate axis: its part towards mic 2 is the elevation error, its part
-  towards mic 4 divided by cos(elevation) the pan error. Speed = `GIMBAL_GAIN` x error, capped and
-  acceleration-limited; moving starts once the total pointing error exceeds `GIMBAL_START_DEG` (20) and stops once it's under `GIMBAL_STOP_DEG` (20), so it rests up to ~20 deg off the source. The tracker's
-  state turns with the plate every packet.
-- **Pose = speed x time** (no position feedback). Speeds come from per-direction tables measured by
-  `gimbal_cal.py`; below the slowest calibrated speed an axis runs at that speed or gets no pulses at all (no
-  creep). Targets are clipped to the travel minus `GIMBAL_LIMIT_MARGIN_DEG`. Automatic mode is refused until
-  `GIMBAL_CALIBRATED` is 1.
-- **Elevation slack.** The worm gear has consistent slack on direction changes (`GIMBAL_TILT_BACKLASH_DEG`,
-  measured by `gimbal_cal.py`). The pose tracks the motor side and moves the plate only once the motor has
-  crossed the slack. Home is zeroed with the slack taken up for moving up (SET HOME / boot assume that).
-- **Tone lost.** Holds position (servos stopped) by default: `GIMBAL_SEARCH_ENABLE` 0, the user's choice. With 1:
-  hold `GIMBAL_SEARCH_DELAY_S`, then listen in turn at pan -45, 0, +45 (elevation 30, servos
-  stopped while listening), `GIMBAL_SEARCH_PASSES` passes, then park at the centre. The array hears its whole front
-  hemisphere, so 3 stops cover the travel; full sweeps added drift (see Measured).
-- **Packet** = `main.cpp`'s + `"GMBL"` + 24 floats; the TDOA scripts still read it. Packets are dropped instead of
-  blocking when no program reads the port, so it runs without a host.
-- **Host commands:** `E1` auto, `E0`/`S` off, `H` set home, `JP`/`JT<deg/s>` jog (counted in the pose, no limits), `NP`/`NT<deg/s> <ms>` jog for exactly that long, `CP`/`CT<us>` raw pulse (calibration, 10 s max), `MP`/`MT<us>` raw pulse that stops 0.3 s after the last one (unused since servo_gui.py was removed),
-  `R` restart the scenario (`gimbal_sim` only).
+GPIO10 (about the vertical) and elevation on GPIO11. Travel is limited by hard stops on the gimbal (pan +-90,
+elevation 0 = facing the horizon to 90 = facing up). Steering uses the mics only: no position estimate.
+- **Error.** The tracked direction's angle off the plate axis towards mic 2 is the elevation error, towards mic 4
+  the pan error. Pan FORWARD (pulse above neutral) swings the axis towards mic 4, elevation FORWARD towards mic 2.
+- **Deadband.** Starts once the total error exceeds `GIMBAL_START_DEG`, stops once it's under `GIMBAL_STOP_DEG`
+  (both 20); an axis with less than `GIMBAL_AXIS_MIN_DEG` of error stays put.
+- **Look, move, look.** The mic estimate lags reality by ~0.15-0.2 s and the servos turn at 60-270 deg/s, so
+  continuous driving overshot (sim: pan swung to +77 for a source at +10, then back). Each move is a burst of at
+  most `GIMBAL_MOVE_S` (pulse offset = `MIN_US` + `US_PER_DEG` x error, capped at `MAX_US`, per axis), then the
+  servos stop for `GIMBAL_SETTLE_S` while the estimate catches up.
+- **Hard stops** (no switches): if a burst + settle that started with a steady estimate doesn't shrink an axis's
+  error by `GIMBAL_STALL_DEG`, that direction is blocked until the beacon needs the other way, or retried after
+  `GIMBAL_BLOCK_RETRY_S`.
+- **Quiet-only estimates.** Servo noise measured +34 to +61 dB within 1 kHz of the tone (`servonoise.py`,
+  2026-11-17), so while any servo gets pulses and for `GIMBAL_QUIET_GAP_S` after, the tracker is frozen and the
+  phase averaging restarts afterwards; the settle counts quiet time only. Bursts can't stop early on arrival, so
+  `GIMBAL_MOVE_S` is short (0.15 s).
+- **Tone lost:** stop and hold.
+- **Packet** = `main.cpp`'s + `"GMBL"` + 18 floats; the TDOA scripts still read it. Never blocks on USB.
+- **Host commands:** `E1` auto, `E0`/`S` off, `JP`/`JT<us>` jog at that pulse offset (stops 0.3 s after the last),
+  `R` restart the scenario (`gimbal_sim`).
 
 ## Files
 | File | What it does |
@@ -84,10 +83,10 @@ GPIO10 (about the vertical, ±90 from centre) and elevation on GPIO11 (0 = plate
 | `host/simcheck.py` | With `tdoa_sim`: board vs known synthetic direction, and vs the Python reference. |
 | `host/selftest.py` | Offline test of the algorithm on synthetic sources. |
 | `host/tdoa_ref.py`, `tstream.py`, `tconfig.py` | Python reference algorithm, serial reader, config reader. |
-| `host/gimbal_view.py` | Gimbal: live map of pose / target / source, status, AUTO / OFF / SET HOME, hold-to-jog with a speed slider (us, as the calibration; counted in the pose, no limits). |
-| `host/gimbal_cal.py` | Gimbal calibration with easy angles (elevation 0 / 90 = plate vertical / horizontal, pan -90 / +90 = side to side): board-timed first move, you fine-adjust onto the target; the board's counted travel vs the known angle gives every speed-table entry and the elevation slack (least squares, one repeat run as a check). `--axis`, `--write`. Runs saved in `host/runs/`. |
-| `host/gimbal_simcheck.py` | With `gimbal_sim`: one 70 s scripted run; true pointing error, acquisition, oscillation, limits, drift. |
-| `host/gstream.py`, `gconfig.py` | Gimbal serial reader (TDOA + GMBL blocks), `gimbal_config.h` reader / writer. |
+| `host/gimbal_view.py` | Gimbal: live plot of the beacon relative to the plate axis (from the mics) with the deadband circle, status, AUTO / OFF, hold-to-jog with a pulse-offset slider. |
+| `host/servonoise.py` | Servo noise: `--test 1` beacon off, noise near the tone with servos stopped vs running; `--test 2 --free` beacon on, SNR / quality / direction scatter (horn off). |
+| `host/gimbal_simcheck.py` | With `gimbal_sim`: one 70 s scripted run; true pointing error per phase vs the best reachable, acquisition, oscillation, time pushing on hard stops. |
+| `host/gstream.py`, `gconfig.py` | Gimbal serial reader (TDOA + GMBL blocks), `gimbal_config.h` reader. |
 
 ## Commands (from the repo root)
 ```
@@ -95,12 +94,23 @@ GPIO10 (about the vertical, ±90 from centre) and elevation on GPIO11 (0 = plate
 cd tdoa/host
 uv run python view.py                                        # or livecheck.py, gcc.py, ...
 ```
-Gimbal: `~/.platformio/penv/bin/pio run -d tdoa -e gimbal -t upload`, then from `tdoa/host`:
-`uv run python gimbal_cal.py --write` (once, reflash after), `uv run python gimbal_view.py`.
+Gimbal: `~/.platformio/penv/bin/pio run -d tdoa -e gimbal -t upload`, then from `tdoa/host`: `uv run python gimbal_view.py`.
 
 Flash the amplitude tracker again with `~/.platformio/penv/bin/pio run -e mic -t upload` from the repo root.
 
 ## Measured
+2026-11-15, mic-only gimbal on `gimbal_sim` (true gimbal with hard stops, 6 deg elevation slack, speeds roughly as
+measured): true error in each phase's last 4 s: still 13.0, moving source 16.1 median / 21.3 worst, reacquired
+elsewhere 11.3, past the pan stop 34.6 (34.4 unavoidable), near zenith 7.9, near horizon 15.6 deg; no reversals;
+1.0 s of pushing on stops in 70 s (blocked, retried every ~3.6 s). The first version blocked elevation falsely after
+a source jump (estimate still catching up): fixed by judging stops only from bursts that start steady, plus retry.
+Entries below about dead reckoning, calibration and slack refer to the earlier, removed position-estimating version.
+
+2026-11-12, frame counting (`gimbal_sim`): N steps of 1 / 2 / 5 frames counted exactly 1.000 / 2.000 / 5.000 frames; a
+J jog stopped by E0 counted a whole 5.000. Easy-angle `gimbal_cal.py` with one-pulse fine steps, scripted user on the
+sim: every speed within 3 % of the sim's error, slack 7.0 vs 6, no redos. Not checked on the real pin: that a new
+duty starts exactly at the next timer overflow is from the ESP-IDF LEDC documentation.
+
 2026-11-12, `gimbal_sim`, easy-angle `gimbal_cal.py` driven by a script watching the sim's true gimbal (sim errors:
 elevation up -5 %, down +5 %, slack 6; pan forward +5 %, reverse -3 %): recovered up -4 / -6 / -7 %, down +5 / +4 / +5 %,
 slack 5.1 deg, pan forward +6 / +6 / +4 %, reverse -3 % at all offsets; stopping tolerance 1.2 deg. Found and fixed
